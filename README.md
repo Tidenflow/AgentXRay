@@ -154,7 +154,7 @@ User Wrapped
 
 ## Roadmap
 
-### Phase 1: Static Trace Demo
+### Phase 1: Real Basic LLM
 
 * 三栏式 UI
 * Agent Mode Tabs
@@ -162,16 +162,10 @@ User Wrapped
 * Trace Timeline
 * Messages Viewer
 * Diff Viewer
-* 四种模式的 mock trace
+* DeepSeek API 接入
+* 真实 request / response payload 展示
 
-### Phase 2: Real Basic LLM
-
-* 接入真实模型
-* 构造 messages
-* 展示 request / response payload
-* 展示 assistant message append 过程
-
-### Phase 3: Real Tool Calling
+### Phase 2: Real Tool Calling
 
 * Tool Registry
 * Calculator Tool
@@ -181,14 +175,14 @@ User Wrapped
 * Tool Result Message Append
 * Second Model Request
 
-### Phase 4: ReAct
+### Phase 3: ReAct
 
 * Action / Observation 循环
 * 多轮 messages 增长
 * 最大轮数限制
 * Final Answer 生成
 
-### Phase 5: Plan-and-Execute
+### Phase 4: Plan-and-Execute
 
 * Planner
 * Executor

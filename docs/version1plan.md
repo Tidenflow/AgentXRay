@@ -1175,8 +1175,8 @@ AgentXRay/
 │       │   │   └── trace-diff.ts
 │       │   ├── tools/
 │       │   │   ├── calculator.ts
-│       │   │   ├── weather-mock.ts
-│       │   │   ├── search-mock.ts
+│       │   │   ├── weather.ts
+│       │   │   ├── search.ts
 │       │   │   └── tool-registry.ts
 │       │   ├── model/
 │       │   │   ├── model-client.ts
@@ -1210,9 +1210,9 @@ src/
 
 # 9. 初版开发路线
 
-## Phase 1: Static Trace Demo
+## Phase 1: Real Basic LLM
 
-目标：先不接真实模型，用 mock trace 跑通 UI。
+目标：先接入真实 DeepSeek 模型，用真实 request / response 跑通 UI。
 
 任务：
 
@@ -1223,35 +1223,14 @@ src/
 实现 Trace Timeline
 实现 Messages Viewer
 实现 Diff Viewer
-为四种模式准备 mock trace
-点击 timeline step 时更新右侧详情
-```
-
-完成标准：
-
-```text
-用户可以切换 Basic / Tool Calling / ReAct / Plan-and-Execute
-每种模式都有对应的 messages stack 变化
-点击每一步能看到 before / after messages
-Diff 能展示新增 message
-```
-
----
-
-## Phase 2: Real Basic LLM
-
-目标：Basic LLM 模式接入真实模型。
-
-任务：
-
-```text
-实现 model client
+实现 DeepSeek model client
 实现 messages builder
 记录 user_wrapped
 记录 system_injected
 记录 model_request_sent
 记录 model_message_received
 记录 final_message_received
+点击 timeline step 时更新右侧详情
 ```
 
 完成标准：
@@ -1259,12 +1238,14 @@ Diff 能展示新增 message
 ```text
 用户输入任意 prompt
 Basic LLM 模式真实返回 assistant answer
+点击每一步能看到 before / after messages
+Diff 能展示新增 message
 右侧可以看到真实 request payload 和 response payload
 ```
 
 ---
 
-## Phase 3: Real Tool Calling
+## Phase 2: Real Tool Calling
 
 目标：实现真实工具调用闭环。
 
@@ -1273,7 +1254,7 @@ Basic LLM 模式真实返回 assistant answer
 ```text
 实现 tool registry
 实现 calculator tool
-实现 weather_mock tool
+实现 weather tool
 实现 tool schema builder
 实现 tool_call parser
 实现 tool executor
@@ -1293,7 +1274,7 @@ Runtime 执行工具
 
 ---
 
-## Phase 4: ReAct
+## Phase 3: ReAct
 
 目标：实现显式 Action / Observation 循环。
 
@@ -1318,7 +1299,7 @@ ReAct Tab 能展示至少一轮 Action → Observation → Final
 
 ---
 
-## Phase 5: Plan-and-Execute
+## Phase 4: Plan-and-Execute
 
 目标：实现 Planner / Executor / Synthesizer 分离。
 
