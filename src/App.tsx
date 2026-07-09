@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -72,19 +72,10 @@ const modeOptions: AgentModeOption[] = [
 
 const tabs: Array<{ id: InspectorTab; label: string; icon: typeof SendHorizontal }> = [
   { id: "input", label: "Sent to LLM", icon: SendHorizontal },
-  { id: "output", label: "LLM Output", icon: Inbox },
+  { id: "output", label: "LLM Response", icon: Inbox },
   { id: "memory", label: "Memory", icon: History },
-  { id: "raw", label: "Raw", icon: Layers3 },
+  { id: "raw", label: "Raw Trace", icon: Layers3 },
 ];
-
-const formatJson = (value: unknown) => JSON.stringify(value, null, 2);
-
-const roleLabel: Record<RuntimeMessage["role"], string> = {
-  system: "system",
-  user: "user",
-  assistant: "assistant",
-  tool: "tool",
-};
 
 const sourceForRole = (role: RuntimeMessage["role"]): RuntimeMessage["source"] => {
   if (role === "system") return "system_prompt";
@@ -496,110 +487,259 @@ function TraceInspector({
 
 function InspectorPanel({ trace, tab }: { trace: TraceRun; tab: InspectorTab }) {
   if (tab === "input") {
-    return (
-      <div className="beginner-panel">
-        <section className="plain-section">
-          <h4>完整发送给 LLM 的一次性输入</h4>
-          <p>
-            远程模型不会自动记住上一次聊天。每一轮请求都必须把 system prompt、
-            历史对话和本轮输入一起发过去。
-          </p>
-        </section>
-        <div className="message-stack">
-          {trace.requestMessages.map((message) => (
-            <MessageBlock
-              isAdded={message.role === "user" && message.content === trace.userPrompt}
-              key={message.id}
-              message={message}
-            />
-          ))}
-        </div>
-        <JsonBlock label="exactRequestPayload" value={trace.requestPayload} />
-      </div>
-    );
+    return <FullInputPackage trace={trace} />;
   }
 
   if (tab === "output") {
-    return (
-      <div className="beginner-panel">
-        <section className="plain-section">
-          <h4>LLM 返回的一次性输出</h4>
-          <p>
-            AgentXRay 把模型当作黑盒：这里只展示远程 API 返回给 Runtime 的可观察结果。
-          </p>
-        </section>
-        <MessageBlock isAdded message={trace.assistantMessage} />
-        <JsonBlock label="exactResponsePayload" value={trace.responsePayload} />
-      </div>
-    );
+    return <FullOutputPackage trace={trace} />;
   }
 
   if (tab === "memory") {
-    return (
-      <div className="beginner-panel">
-        <section className="plain-section">
-          <h4>记忆是怎么来的</h4>
-          <p>
-            LLM 本身不保存你们刚才聊过什么。Runtime 会把历史 user / assistant
-            消息保存在本地，并在下一次请求时重新放进输入包。
-          </p>
-        </section>
-        {trace.memoryMessages.length > 0 ? (
-          <div className="message-stack">
-            {trace.memoryMessages.map((message) => (
-              <MessageBlock
-                isAdded={false}
-                key={message.id}
-                message={message}
-              />
-            ))}
-          </div>
-        ) : (
-          <div className="empty-panel">
-            这是第一轮请求，暂时没有上一轮对话可带入。问第二个问题时，这里会出现上一轮
-            user / assistant 消息。
-          </div>
-        )}
-        <JsonBlock label="savedForNextTurn" value={trace.conversationMessages} />
-      </div>
-    );
+    return <MemoryPackage trace={trace} />;
   }
 
-  return <JsonBlock label="rawTraceRun" value={trace} />;
+  return <RawTracePackage trace={trace} />;
 }
 
-function MessageBlock({
-  message,
-  isAdded,
-}: {
-  message: RuntimeMessage;
-  isAdded: boolean;
-}) {
+function FullInputPackage({ trace }: { trace: TraceRun }) {
+  const payload = trace.requestPayload as {
+    model?: string;
+    temperature?: number;
+    messages?: Array<{ role: RuntimeMessage["role"]; content: string | null }>;
+  };
+
   return (
-    <article className={`message-block role-${message.role} ${isAdded ? "is-added" : ""}`}>
+    <section className="full-package">
       <header>
-        <span className="role-badge">{roleLabel[message.role]}</span>
-        <span>{message.source}</span>
-        <code>{message.id}</code>
+        <span>完整发送 JSON</span>
+        <small>绿色部分是用户提示词</small>
       </header>
-      <pre>{formatJson(message)}</pre>
-    </article>
+      <div className="json-compose">
+        <span>{`{\n`}</span>
+        <AnnotatedJsonBlock tone="neutral" label="model config">
+          {`  "model": ${JSON.stringify(payload.model)},
+  "temperature": ${JSON.stringify(payload.temperature)},`}
+        </AnnotatedJsonBlock>
+        {trace.requestMessages.map((message, index) => {
+          const apiMessage = payload.messages?.[index] ?? {
+            role: message.role,
+            content: message.content ?? null,
+          };
+          const suffix = index === trace.requestMessages.length - 1 ? "\n" : ",\n";
+          const prefix = index === 0 ? `  "messages": [\n` : "";
+          const closing = index === trace.requestMessages.length - 1 ? `  ]\n}` : "";
+          const isCurrentPrompt = message.role === "user" && message.content === trace.userPrompt;
+          const label =
+            message.role === "system"
+              ? "system prompt"
+              : isCurrentPrompt
+                ? "current user prompt"
+                : "conversation memory";
+          const tone =
+            message.role === "system" ? "warm" : isCurrentPrompt ? "green" : "neutral";
+          const messageJson = `    ${JSON.stringify(apiMessage, null, 2).replace(/\n/g, "\n    ")}`;
+
+          if (isCurrentPrompt) {
+            return (
+              <span key={`json-${message.id}`}>
+                <AnnotatedJsonBlock tone={tone} label={label}>
+                  {`${prefix}    {
+      "role": ${JSON.stringify(apiMessage.role)},
+      "content": `}
+                  <span className="json-current-prompt">{JSON.stringify(apiMessage.content)}</span>
+                  {`
+    }${suffix}${closing}`}
+                </AnnotatedJsonBlock>
+              </span>
+            );
+          }
+
+          return (
+            <span key={`json-${message.id}`}>
+              <AnnotatedJsonBlock tone={tone} label={label}>
+                {prefix}
+                {messageJson}
+                {suffix}
+                {closing}
+              </AnnotatedJsonBlock>
+            </span>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 
-function JsonBlock({
+function FullOutputPackage({ trace }: { trace: TraceRun }) {
+  const responsePayload = trace.responsePayload as {
+    choices?: Array<{
+      message?: {
+        role?: RuntimeMessage["role"];
+        content?: string | null;
+        reasoning_content?: string;
+      };
+      [key: string]: unknown;
+    }>;
+    [key: string]: unknown;
+  };
+  const choices = responsePayload.choices ?? [];
+
+  return (
+    <section className="full-package">
+      <header>
+        <span>完整 LLM Response JSON</span>
+        <small className="purple-hint">紫色部分是 AI 回答</small>
+      </header>
+      <div className="json-compose">
+        {Object.entries(responsePayload)
+          .filter(([key]) => key !== "choices")
+          .map(([key, value], index, entries) => {
+            const tone = key === "usage" ? "warm" : "neutral";
+            const label = key === "usage" ? "token usage" : "response metadata";
+            const prefix = index === 0 ? "{\n" : "";
+
+            return (
+              <AnnotatedJsonBlock key={key} tone={tone} label={label}>
+                {`${prefix}  ${JSON.stringify(key)}: ${JSON.stringify(value, null, 2).replace(/\n/g, "\n  ")}${entries.length > 0 || choices.length > 0 ? "," : ""}\n`}
+              </AnnotatedJsonBlock>
+            );
+          })}
+        {choices.map((choice, index) => {
+          const message = choice.message ?? {};
+          const restChoice = Object.fromEntries(
+            Object.entries(choice).filter(([key]) => key !== "message"),
+          );
+          const suffix = index === choices.length - 1 ? "\n" : ",\n";
+          const prefix = index === 0 ? `  "choices": [\n` : "";
+          const closing = index === choices.length - 1 ? `  ]\n}` : "";
+
+          return (
+            <span key={`choice-${index}`}>
+              <AnnotatedJsonBlock tone="purple" label="assistant output">
+                {`${prefix}    {
+      "message": {
+        "role": ${JSON.stringify(message.role)},
+        "content": `}
+                <span className="json-ai-answer">{JSON.stringify(message.content ?? null)}</span>
+                {Object.prototype.hasOwnProperty.call(message, "reasoning_content")
+                  ? `,
+        "reasoning_content": ${JSON.stringify(message.reasoning_content)}`
+                  : ""}
+                {`
+      }`}
+                {Object.keys(restChoice).length > 0
+                  ? `,
+${JSON.stringify(restChoice, null, 6)
+  .slice(2, -2)
+  .replace(/\n/g, "\n      ")}`
+                  : ""}
+                {`
+    }`}
+                {suffix}
+                {closing}
+              </AnnotatedJsonBlock>
+            </span>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function MemoryPackage({ trace }: { trace: TraceRun }) {
+  return (
+    <section className="full-package">
+      <header>
+        <span>Memory JSON</span>
+        <small>下一轮会带上的对话记录</small>
+      </header>
+      <div className="json-compose">
+        {trace.conversationMessages.map((message, index) => {
+          const suffix = index === trace.conversationMessages.length - 1 ? "\n" : ",\n";
+          const prefix = index === 0 ? "[\n" : "";
+          const closing = index === trace.conversationMessages.length - 1 ? "]" : "";
+          const label =
+            message.role === "user" ? "saved user prompt" : "saved assistant response";
+          const tone = message.role === "user" ? "green" : "purple";
+          const messageJson = `  ${JSON.stringify(
+            {
+              role: message.role,
+              content: message.content ?? null,
+            },
+            null,
+            2,
+          ).replace(/\n/g, "\n  ")}`;
+
+          return (
+            <span key={`memory-${message.id}`}>
+              <AnnotatedJsonBlock tone={tone} label={label}>
+                {prefix}
+                {messageJson}
+                {suffix}
+                {closing}
+              </AnnotatedJsonBlock>
+            </span>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function RawTracePackage({ trace }: { trace: TraceRun }) {
+  const traceMeta = {
+    id: trace.id,
+    mode: trace.mode,
+    modeName: trace.modeName,
+    turnNumber: trace.turnNumber,
+    model: trace.model,
+    temperature: trace.temperature,
+    durationMs: trace.durationMs,
+  };
+
+  return (
+    <section className="full-package">
+      <header>
+        <span>Raw Trace JSON</span>
+        <small>AgentXRay 保存的整条运行记录</small>
+      </header>
+      <div className="json-compose">
+        <AnnotatedJsonBlock tone="neutral" label="trace metadata">
+          {`{
+  "meta": ${JSON.stringify(traceMeta, null, 2).replace(/\n/g, "\n  ")},`}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="green" label="request payload">
+          {`  "requestPayload": ${JSON.stringify(trace.requestPayload, null, 2).replace(/\n/g, "\n  ")},`}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="purple" label="llm response">
+          {`  "responsePayload": ${JSON.stringify(trace.responsePayload, null, 2).replace(/\n/g, "\n  ")},`}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="warm" label="memory snapshot">
+          {`  "conversationMessages": ${JSON.stringify(
+            trace.conversationMessages,
+            null,
+            2,
+          ).replace(/\n/g, "\n  ")}
+}`}
+        </AnnotatedJsonBlock>
+      </div>
+    </section>
+  );
+}
+
+function AnnotatedJsonBlock({
+  children,
   label,
-  value,
-  accent,
+  tone,
 }: {
+  children: ReactNode;
   label: string;
-  value: unknown;
-  accent?: "added";
+  tone: "green" | "purple" | "warm" | "neutral";
 }) {
   return (
-    <section className={`json-block ${accent === "added" ? "is-added" : ""}`}>
-      <header>{label}</header>
-      <pre>{typeof value === "string" ? value : formatJson(value)}</pre>
-    </section>
+    <span className={`json-annotation json-annotation-${tone}`}>
+      <span className="json-annotation-label">{label}</span>
+      {children}
+    </span>
   );
 }
