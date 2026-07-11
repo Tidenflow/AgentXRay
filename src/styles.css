@@ -726,6 +726,175 @@ pre {
   font-weight: 650;
 }
 
+/* ---- Plan-and-Execute Chat View ---- */
+
+.plan-phase {
+  margin: 10px 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fffefb;
+  overflow: hidden;
+  box-shadow: 0 6px 18px rgba(36, 34, 28, 0.04);
+}
+
+.plan-phase-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-soft);
+  font-size: 12px;
+}
+
+.plan-phase-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  color: #fffefb;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.phase-planner {
+  background: #7856a8;
+}
+
+.phase-executor {
+  background: var(--amber);
+}
+
+.phase-synthesizer {
+  background: var(--green);
+}
+
+.plan-phase-summary {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.plan-list {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.plan-step-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.plan-step-num {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--panel-soft);
+  color: var(--amber);
+  font-size: 11px;
+  font-weight: 750;
+  flex-shrink: 0;
+}
+
+.plan-exec-step-desc {
+  padding: 10px 16px;
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+
+.plan-exec-tools {
+  padding: 10px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.plan-exec-tool-item {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-soft);
+}
+
+.plan-exec-tool-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(241, 234, 217, 0.5);
+  font-size: 12px;
+}
+
+.plan-exec-tool-header code {
+  margin: 0;
+  padding: 0 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  background: #fffefb;
+  color: var(--amber);
+  font-size: 11px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.plan-exec-tool-item pre {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.5;
+  max-height: 120px;
+  border-bottom: 1px solid var(--line);
+}
+
+.plan-exec-tool-result {
+  padding: 8px 10px;
+}
+
+.plan-exec-tool-label,
+.plan-exec-result-label {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.plan-exec-tool-result pre {
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fffefb;
+  font-size: 11px;
+  max-height: 100px;
+}
+
+.plan-exec-result {
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+  background: rgba(239, 249, 240, 0.35);
+}
+
+.plan-exec-result p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
 @media (max-width: 1280px) {
   body {
     min-width: 980px;
