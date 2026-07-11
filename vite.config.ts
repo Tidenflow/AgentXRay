@@ -19,6 +19,7 @@ type ChatRequest = {
   }>;
   prompt?: string;
   temperature?: number;
+  maxRounds?: number;
 };
 
 type ChatMessage = NonNullable<ChatRequest["messages"]>[number];
@@ -46,6 +47,24 @@ type ToolExecution = {
   content: string;
   ok: boolean;
   error?: string;
+};
+
+type ReActParsedStep = {
+  thought?: string;
+  action?: string;
+  actionInput?: unknown;
+  finalAnswer?: string;
+  parseError?: string;
+};
+
+type ReActStep = {
+  round: number;
+  assistantContent: string;
+  parsed: ReActParsedStep;
+  toolExecution?: ToolExecution;
+  observationMessage?: ChatMessage;
+  requestPayload: unknown;
+  responsePayload: unknown;
 };
 
 const readBody = async (req: IncomingMessage) =>
@@ -301,6 +320,94 @@ const createToolResultMessage = (execution: ToolExecution): ChatMessage => ({
   content: execution.content,
 });
 
+const reactToolGuide = localToolDefinitions
+  .map(
+    (tool) =>
+      `- ${tool.function.name}: ${tool.function.description} Parameters: ${JSON.stringify(
+        tool.function.parameters,
+      )}`,
+  )
+  .join("\n");
+
+const extractJsonObject = (value: string): string => {
+  const start = value.indexOf("{");
+  const end = value.lastIndexOf("}");
+
+  if (start === -1 || end === -1 || end < start) {
+    throw new Error("Action Input must contain a JSON object.");
+  }
+
+  return value.slice(start, end + 1);
+};
+
+const parseReActResponse = (content: string): ReActParsedStep => {
+  const finalMatch = content.match(/Final Answer\s*:\s*([\s\S]*)/i);
+  if (finalMatch?.[1]?.trim()) {
+    return {
+      thought: content.match(/Thought\s*:\s*([\s\S]*?)(?:Final Answer\s*:|$)/i)?.[1]?.trim(),
+      finalAnswer: finalMatch[1].trim(),
+    };
+  }
+
+  const actionMatch = content.match(/Action\s*:\s*([a-zA-Z0-9_-]+)/i);
+  const inputMatch = content.match(/Action Input\s*:\s*([\s\S]*)/i);
+  if (!actionMatch?.[1] || !inputMatch?.[1]) {
+    return {
+      thought: content.match(/Thought\s*:\s*([\s\S]*)/i)?.[1]?.trim(),
+      parseError:
+        'Expected either "Final Answer: ..." or both "Action: <tool>" and "Action Input: {...}".',
+    };
+  }
+
+  try {
+    return {
+      thought: content.match(/Thought\s*:\s*([\s\S]*?)(?:Action\s*:|$)/i)?.[1]?.trim(),
+      action: actionMatch[1].trim(),
+      actionInput: JSON.parse(extractJsonObject(inputMatch[1])),
+    };
+  } catch (error) {
+    return {
+      thought: content.match(/Thought\s*:\s*([\s\S]*?)(?:Action\s*:|$)/i)?.[1]?.trim(),
+      action: actionMatch[1].trim(),
+      parseError: error instanceof Error ? error.message : "Could not parse Action Input.",
+    };
+  }
+};
+
+const createReActToolExecution = (round: number, parsed: ReActParsedStep): ToolExecution => {
+  const toolCall: ToolCall = {
+    id: `react-round-${round}`,
+    type: "function",
+    function: {
+      name: parsed.action ?? "unknown",
+      arguments: JSON.stringify(parsed.actionInput ?? {}),
+    },
+  };
+
+  if (parsed.parseError) {
+    return {
+      toolCall,
+      name: toolCall.function.name,
+      arguments: parsed.actionInput ?? {},
+      content: JSON.stringify({ error: parsed.parseError }),
+      ok: false,
+      error: parsed.parseError,
+    };
+  }
+
+  return executeLocalTool(toolCall);
+};
+
+const createObservationMessage = (execution: ToolExecution): ChatMessage => ({
+  role: "user",
+  content: `Observation: ${execution.content}
+
+Continue the ReAct loop. If the observation is enough, respond with "Final Answer: ...". Otherwise use exactly one more Action.`,
+});
+
+const finalAnswerFromContent = (content: string) =>
+  content.match(/Final Answer\s*:\s*([\s\S]*)/i)?.[1]?.trim() ?? content.trim();
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const baseUrl = env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
@@ -495,6 +602,146 @@ export default defineConfig(({ mode }) => {
                 toolExecutions,
                 followUpRequestPayload,
                 followUpResponsePayload: followUpCompletion?.responsePayload ?? null,
+              });
+            } catch (error) {
+              sendJson(res, 500, {
+                error: error instanceof Error ? error.message : "Unknown DeepSeek proxy error.",
+              });
+            }
+          });
+
+          server.middlewares.use("/api/deepseek/react", async (req, res, next) => {
+            if (req.method !== "POST") {
+              next();
+              return;
+            }
+
+            if (!env.DEEPSEEK_API_KEY) {
+              sendJson(res, 500, {
+                error: "Missing DEEPSEEK_API_KEY. Add it to .env before running a trace.",
+              });
+              return;
+            }
+
+            try {
+              const body = JSON.parse((await readBody(req)) || "{}") as ChatRequest;
+              const initialMessages = readChatMessages(body);
+
+              if (initialMessages.length === 0) {
+                sendJson(res, 400, { error: "Messages or prompt are required." });
+                return;
+              }
+
+              const maxRounds = Math.max(1, Math.min(body.maxRounds ?? 4, 8));
+              const startedAt = Date.now();
+              const reactSteps: ReActStep[] = [];
+              let loopMessages = initialMessages;
+              let finalAnswer = "";
+              let finalRequestPayload: unknown = null;
+              let finalResponsePayload: unknown = null;
+
+              for (let round = 1; round <= maxRounds; round += 1) {
+                const requestPayload = {
+                  model,
+                  temperature: body.temperature ?? defaultTemperature,
+                  messages: loopMessages,
+                };
+                const completion = await runChatCompletion(requestPayload);
+
+                if (!completion.ok) {
+                  sendJson(res, completion.status, {
+                    error: "DeepSeek ReAct round request failed.",
+                    requestPayload,
+                    responsePayload: completion.responsePayload,
+                    reactSteps,
+                    status: completion.status,
+                  });
+                  return;
+                }
+
+                const assistantMessage = (
+                  completion.responsePayload as {
+                    choices?: Array<{ message?: ChatMessage }>;
+                  } | null
+                )?.choices?.[0]?.message;
+                const assistantContent = assistantMessage?.content ?? "";
+                const parsed = parseReActResponse(assistantContent);
+                const step: ReActStep = {
+                  round,
+                  assistantContent,
+                  parsed,
+                  requestPayload,
+                  responsePayload: completion.responsePayload,
+                };
+
+                reactSteps.push(step);
+
+                if (parsed.finalAnswer) {
+                  finalAnswer = parsed.finalAnswer;
+                  finalResponsePayload = completion.responsePayload;
+                  break;
+                }
+
+                const toolExecution = createReActToolExecution(round, parsed);
+                const observationMessage = createObservationMessage(toolExecution);
+                step.toolExecution = toolExecution;
+                step.observationMessage = observationMessage;
+                loopMessages = [
+                  ...loopMessages,
+                  { role: "assistant", content: assistantContent },
+                  observationMessage,
+                ];
+              }
+
+              if (!finalAnswer) {
+                finalRequestPayload = {
+                  model,
+                  temperature: body.temperature ?? defaultTemperature,
+                  messages: [
+                    ...loopMessages,
+                    {
+                      role: "user" as const,
+                      content:
+                        "Max ReAct rounds reached. Produce the best concise response now using the observations. Start with Final Answer:",
+                    },
+                  ],
+                };
+                const finalCompletion = await runChatCompletion(finalRequestPayload);
+
+                if (!finalCompletion.ok) {
+                  sendJson(res, finalCompletion.status, {
+                    error: "DeepSeek ReAct final answer request failed.",
+                    reactSteps,
+                    finalRequestPayload,
+                    finalResponsePayload: finalCompletion.responsePayload,
+                    status: finalCompletion.status,
+                  });
+                  return;
+                }
+
+                finalResponsePayload = finalCompletion.responsePayload;
+                const finalContent =
+                  (
+                    finalCompletion.responsePayload as {
+                      choices?: Array<{ message?: { content?: string | null } }>;
+                    } | null
+                  )?.choices?.[0]?.message?.content ?? "";
+                finalAnswer = finalAnswerFromContent(finalContent);
+              }
+
+              sendJson(res, 200, {
+                baseUrl,
+                model,
+                durationMs: Date.now() - startedAt,
+                requestPayload: reactSteps[0]?.requestPayload ?? null,
+                responsePayload: reactSteps[0]?.responsePayload ?? null,
+                toolDefinitions: localToolDefinitions,
+                reactToolGuide,
+                reactSteps,
+                finalRequestPayload,
+                finalResponsePayload,
+                finalAnswer,
+                maxRounds,
               });
             } catch (error) {
               sendJson(res, 500, {

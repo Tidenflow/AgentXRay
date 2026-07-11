@@ -40,6 +40,27 @@ export type ToolExecution = {
   error?: string;
 };
 
+export type ReActParsedStep = {
+  thought?: string;
+  action?: string;
+  actionInput?: unknown;
+  finalAnswer?: string;
+  parseError?: string;
+};
+
+export type ReActStep = {
+  round: number;
+  assistantContent: string;
+  parsed: ReActParsedStep;
+  toolExecution?: ToolExecution;
+  observationMessage?: {
+    role: "user";
+    content: string;
+  };
+  requestPayload: unknown;
+  responsePayload: unknown;
+};
+
 export type TraceRun = {
   id: string;
   mode: AgentModeId;
