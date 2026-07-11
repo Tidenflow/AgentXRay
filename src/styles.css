@@ -606,6 +606,126 @@ pre {
   word-break: break-word;
 }
 
+/* ---- ReAct Chat View ---- */
+
+.react-round {
+  margin: 8px 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fffefb;
+  overflow: hidden;
+  box-shadow: 0 6px 18px rgba(36, 34, 28, 0.04);
+}
+
+.react-round-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-soft);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.react-round-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: #fffefb;
+  color: var(--amber);
+  font-size: 11px;
+}
+
+.react-round-duration {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.react-step {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.react-step:last-child {
+  border-bottom: 0;
+}
+
+.react-step-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.react-step-label code {
+  margin: 0;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-soft);
+  color: var(--amber);
+  font-size: 11px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}
+
+.react-step p {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.react-step pre {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-soft);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  max-height: 200px;
+}
+
+.react-thought-step {
+  background: rgba(241, 234, 217, 0.42);
+}
+
+.react-action-step {
+  background: rgba(239, 249, 240, 0.52);
+}
+
+.react-observation-step {
+  background: rgba(246, 240, 251, 0.42);
+}
+
+.react-error-step {
+  background: rgba(246, 233, 230, 0.55);
+  color: var(--danger);
+}
+
+.react-error-step .react-step-label {
+  color: var(--danger);
+}
+
+.react-summary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
 @media (max-width: 1280px) {
   body {
     min-width: 980px;

@@ -14,7 +14,7 @@ import {
   Settings2,
   Wrench,
 } from "lucide-react";
-import type { AgentModeId, RuntimeMessage, ToolExecution, TraceRun } from "./types";
+import type { AgentModeId, ReActStep, RuntimeMessage, ToolExecution, TraceRun } from "./types";
 
 type InspectorTab = "input" | "output" | "tools" | "memory" | "raw";
 
@@ -58,6 +58,21 @@ type ToolCallingResult = DeepSeekResult & {
   followUpResponsePayload: DeepSeekResult["responsePayload"] | null;
 };
 
+type ReActResult = {
+  baseUrl: string;
+  model: string;
+  durationMs: number;
+  requestPayload: unknown;
+  responsePayload: unknown;
+  toolDefinitions: unknown[];
+  reactToolGuide: string;
+  reactSteps: ReActStep[];
+  finalRequestPayload: unknown | null;
+  finalResponsePayload: unknown | null;
+  finalAnswer: string;
+  maxRounds: number;
+};
+
 const modeOptions: AgentModeOption[] = [
   {
     id: "basic",
@@ -74,8 +89,8 @@ const modeOptions: AgentModeOption[] = [
   {
     id: "react",
     name: "ReAct",
-    description: "等待真实 Action / Observation parser 接入后启用。",
-    enabled: false,
+    description: "Action / Observation 循环，多轮推理，工具执行与最终答案合成。",
+    enabled: true,
   },
   {
     id: "plan-execute",
@@ -133,6 +148,30 @@ const toolCallingSystemPromptMessage = (): RuntimeMessage =>
     "tool-system-prompt",
     "system",
     "You are a helpful assistant. Use the provided tools when they can answer the user more accurately. After tool results are provided, explain the final answer directly and briefly.",
+  );
+
+const reactSystemPromptMessage = (): RuntimeMessage =>
+  toRuntimeMessage(
+    "react-system-prompt",
+    "system",
+    `You are a helpful assistant that solves problems step by step using the ReAct (Reasoning + Acting) framework.
+
+You have access to these tools:
+- calculate: Evaluate a deterministic arithmetic expression. Supports +, -, *, /, %, ^, parentheses, and decimals.
+- get_current_datetime: Get the current date and time for a requested IANA time zone.
+
+You MUST respond in exactly this format:
+
+Thought: <your step-by-step reasoning about what to do next>
+Action: <tool name>
+Action Input: <JSON object with the tool parameters>
+
+After receiving an Observation, continue with another cycle, or finish with:
+
+Thought: <your final reasoning>
+Final Answer: <your concise answer to the user in natural language>
+
+Always start with a Thought. Use exactly ONE Action per response. Never output anything outside this format.`,
   );
 
 const buildTraceFromDeepSeek = (
@@ -279,6 +318,64 @@ const buildTraceFromToolCalling = (
   };
 };
 
+const buildTraceFromReAct = (
+  prompt: string,
+  result: ReActResult,
+  turnNumber: number,
+): TraceRun => {
+  const initialReqMessages =
+    (
+      result.requestPayload as {
+        messages?: Array<{ role: string; content: string | null }>;
+      }
+    )?.messages?.map((msg, i) =>
+      toRuntimeMessage(`react-req-${i + 1}`, msg.role as RuntimeMessage["role"], msg.content),
+    ) ?? [];
+
+  const currentUserIndex = initialReqMessages.reduce(
+    (latestIndex, message, index) => (message.role === "user" ? index : latestIndex),
+    -1,
+  );
+  const currentUserMessage = initialReqMessages[currentUserIndex];
+  const memoryMessages = initialReqMessages.filter(
+    (message, index) => message.role !== "system" && index !== currentUserIndex,
+  );
+
+  const assistantMessage = toRuntimeMessage(
+    `turn-${turnNumber}-assistant`,
+    "assistant",
+    result.finalAnswer,
+  );
+
+  const conversationMessages = (
+    currentUserMessage
+      ? [...memoryMessages, currentUserMessage, assistantMessage]
+      : [assistantMessage]
+  ).filter(Boolean) as RuntimeMessage[];
+
+  const now = Date.now();
+
+  return {
+    id: `trace-${now}`,
+    mode: "react",
+    modeName: "ReAct",
+    description: `ReAct loop: ${result.reactSteps.length} round(s) of max ${result.maxRounds}.`,
+    turnNumber,
+    userPrompt: prompt,
+    finalAnswer: result.finalAnswer,
+    temperature:
+      (result.requestPayload as { temperature?: number })?.temperature ?? 0.7,
+    model: result.model,
+    durationMs: result.durationMs,
+    requestPayload: result,
+    responsePayload: result,
+    requestMessages: initialReqMessages,
+    memoryMessages,
+    conversationMessages,
+    assistantMessage,
+  };
+};
+
 export function App() {
   const [activeMode, setActiveMode] = useState<AgentModeId>("basic");
   const [prompt, setPrompt] = useState("");
@@ -313,11 +410,33 @@ export function App() {
       const turnNumber =
         conversationMessages.filter((message) => message.role === "user").length + 1;
       const userMessage = toRuntimeMessage(`turn-${turnNumber}-user`, "user", cleanPrompt);
+
       const systemMessage =
-        activeMode === "tool-calling" ? toolCallingSystemPromptMessage() : systemPromptMessage();
-      const requestMessages = [systemMessage, ...conversationMessages, userMessage];
+        activeMode === "tool-calling"
+          ? toolCallingSystemPromptMessage()
+          : activeMode === "react"
+            ? reactSystemPromptMessage()
+            : systemPromptMessage();
+
+      // For ReAct, only carry forward user prompts + final assistant answers (no intermediate loop steps)
+      const contextMessages =
+        activeMode === "react"
+          ? conversationMessages.filter(
+              (m) =>
+                m.role === "user" ||
+                (m.role === "assistant" && !m.tool_calls?.length && m.content),
+            )
+          : conversationMessages;
+
+      const requestMessages = [systemMessage, ...contextMessages, userMessage];
+
       const endpoint =
-        activeMode === "tool-calling" ? "/api/deepseek/tool-calling" : "/api/deepseek/chat";
+        activeMode === "tool-calling"
+          ? "/api/deepseek/tool-calling"
+          : activeMode === "react"
+            ? "/api/deepseek/react"
+            : "/api/deepseek/chat";
+
       const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -332,7 +451,10 @@ export function App() {
       const trace =
         activeMode === "tool-calling"
           ? buildTraceFromToolCalling(cleanPrompt, payload as ToolCallingResult, turnNumber)
-          : buildTraceFromDeepSeek(cleanPrompt, payload as DeepSeekResult, turnNumber);
+          : activeMode === "react"
+            ? buildTraceFromReAct(cleanPrompt, payload as ReActResult, turnNumber)
+            : buildTraceFromDeepSeek(cleanPrompt, payload as DeepSeekResult, turnNumber);
+
       setTraces((current) => [trace, ...current]);
       setConversationMessages(trace.conversationMessages);
       setActiveTraceId(trace.id);
@@ -483,6 +605,8 @@ function ChatPane({
     return message.role === "assistant" && (!!message.content || !!message.tool_calls?.length);
   });
 
+  const isReActTrace = trace?.mode === "react" && isReActResult(trace.requestPayload);
+
   return (
     <section className="chat-pane">
       <header className="chat-header">
@@ -497,7 +621,12 @@ function ChatPane({
       </header>
 
       <div className="chat-scroll">
-        {chatMessages.length > 0 ? (
+        {isReActTrace ? (
+          <ReActChatView
+            result={trace!.requestPayload as ReActResult}
+            userPrompt={trace!.userPrompt}
+          />
+        ) : chatMessages.length > 0 ? (
           chatMessages.map((message) => (
             <article
               className={`chat-message ${
@@ -676,7 +805,104 @@ const isToolCallingRequestPayload = (value: unknown): value is ToolCallingReques
 const isToolCallingResponsePayload = (value: unknown): value is ToolCallingResponsePayload =>
   isRecord(value) && "initialResponsePayload" in value;
 
+const isReActResult = (value: unknown): value is ReActResult =>
+  isRecord(value) && "reactSteps" in value && "finalAnswer" in value;
+
+function ReActChatView({
+  result,
+  userPrompt,
+}: {
+  result: ReActResult;
+  userPrompt: string;
+}) {
+  return (
+    <>
+      <article className="chat-message user-message">
+        <div className="message-author">You</div>
+        <p>{userPrompt}</p>
+      </article>
+
+      {result.reactSteps.map((step) => (
+        <div className="react-round" key={`react-round-${step.round}`}>
+          <div className="react-round-header">
+            <span className="react-round-badge">Round {step.round}</span>
+            <span className="react-round-duration">
+              {step.round === result.reactSteps.length && result.finalAnswer
+                ? "→ Final Answer"
+                : "→ Observation"}
+            </span>
+          </div>
+
+          {step.parsed.thought && (
+            <div className="react-step react-thought-step">
+              <div className="react-step-label">💭 Thought</div>
+              <p>{step.parsed.thought}</p>
+            </div>
+          )}
+
+          {step.parsed.parseError && (
+            <div className="react-step react-error-step">
+              <div className="react-step-label">
+                <AlertCircle size={14} />
+                Parse Warning
+              </div>
+              <p>{step.parsed.parseError}</p>
+            </div>
+          )}
+
+          {step.parsed.action && (
+            <div className="react-step react-action-step">
+              <div className="react-step-label">
+                🔧 Action: <code>{step.parsed.action}</code>
+              </div>
+              <pre>{JSON.stringify(step.parsed.actionInput, null, 2)}</pre>
+            </div>
+          )}
+
+          {step.toolExecution && (
+            <div className="react-step react-observation-step">
+              <div className="react-step-label">
+                {step.toolExecution.ok ? "✅" : "❌"} Observation
+                {step.toolExecution.ok
+                  ? ""
+                  : ` · ${step.toolExecution.error ?? "Unknown error"}`}
+              </div>
+              <pre>{step.toolExecution.content}</pre>
+            </div>
+          )}
+        </div>
+      ))}
+
+      {result.finalAnswer ? (
+        <article className="chat-message assistant-message">
+          <div className="message-author">Assistant (Final Answer)</div>
+          <p>{result.finalAnswer}</p>
+        </article>
+      ) : result.finalRequestPayload ? (
+        <article className="chat-message assistant-message">
+          <div className="message-author">Assistant (Max Rounds Reached)</div>
+          <p>
+            The ReAct loop reached its round limit ({result.maxRounds}) and produced a
+            best-effort synthesis.
+          </p>
+        </article>
+      ) : null}
+
+      <div className="react-summary">
+        <span>
+          {result.reactSteps.length} round{result.reactSteps.length !== 1 ? "s" : ""} ·{" "}
+          {result.durationMs}ms · max {result.maxRounds}
+        </span>
+      </div>
+    </>
+  );
+}
+
 function FullInputPackage({ trace }: { trace: TraceRun }) {
+  if (isReActResult(trace.requestPayload)) {
+    return <ReActInputPackage payload={trace.requestPayload} />;
+  }
+
   if (isToolCallingRequestPayload(trace.requestPayload)) {
     return <ToolCallingInputPackage payload={trace.requestPayload} />;
   }
@@ -784,7 +1010,51 @@ function ToolCallingInputPackage({
   );
 }
 
+function ReActInputPackage({ payload }: { payload: ReActResult }) {
+  const initialReq = payload.requestPayload as {
+    messages?: Array<{ role: string; content: string | null }>;
+  };
+
+  return (
+    <section className="full-package">
+      <header>
+        <span>ReAct 输入链路</span>
+        <small>system prompt → tool guide → round-by-round requests</small>
+      </header>
+      <div className="json-compose">
+        <AnnotatedJsonBlock tone="warm" label="initial request (system + context + user)">
+          {JSON.stringify(payload.requestPayload, null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="green" label="tool definitions">
+          {JSON.stringify(payload.toolDefinitions ?? [], null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="neutral" label="ReAct tool guide (injected into system prompt)">
+          {JSON.stringify(payload.reactToolGuide, null, 2)}
+        </AnnotatedJsonBlock>
+        {payload.reactSteps.map((step, index) => (
+          <AnnotatedJsonBlock
+            key={`react-req-round-${step.round}`}
+            tone={index === payload.reactSteps.length - 1 && payload.finalAnswer ? "purple" : "neutral"}
+            label={`round ${step.round} request (${payload.finalAnswer && index === payload.reactSteps.length - 1 ? "final" : "tool call"})`}
+          >
+            {JSON.stringify(step.requestPayload, null, 2)}
+          </AnnotatedJsonBlock>
+        ))}
+        {payload.finalRequestPayload ? (
+          <AnnotatedJsonBlock tone="purple" label="final synthesis request (max rounds reached)">
+            {JSON.stringify(payload.finalRequestPayload, null, 2)}
+          </AnnotatedJsonBlock>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
 function FullOutputPackage({ trace }: { trace: TraceRun }) {
+  if (isReActResult(trace.responsePayload)) {
+    return <ReActOutputPackage payload={trace.responsePayload} />;
+  }
+
   if (isToolCallingResponsePayload(trace.responsePayload)) {
     return <ToolCallingOutputPackage payload={trace.responsePayload} />;
   }
@@ -890,7 +1160,61 @@ function ToolCallingOutputPackage({ payload }: { payload: ToolCallingResponsePay
   );
 }
 
+function ReActOutputPackage({ payload }: { payload: ReActResult }) {
+  return (
+    <section className="full-package">
+      <header>
+        <span>ReAct 输出链路</span>
+        <small className="purple-hint">thought → action → observation → ... → final answer</small>
+      </header>
+      <div className="json-compose">
+        {payload.reactSteps.map((step) => (
+          <span key={`react-out-round-${step.round}`}>
+            <AnnotatedJsonBlock
+              tone="warm"
+              label={`round ${step.round} response`}
+            >
+              {JSON.stringify(step.responsePayload, null, 2)}
+            </AnnotatedJsonBlock>
+            <AnnotatedJsonBlock
+              tone="neutral"
+              label={`round ${step.round} parsed`}
+            >
+              {JSON.stringify(step.parsed, null, 2)}
+            </AnnotatedJsonBlock>
+            {step.toolExecution ? (
+              <AnnotatedJsonBlock
+                tone="green"
+                label={`round ${step.round} tool execution`}
+              >
+                {JSON.stringify(step.toolExecution, null, 2)}
+              </AnnotatedJsonBlock>
+            ) : null}
+            {step.observationMessage ? (
+              <AnnotatedJsonBlock
+                tone="purple"
+                label={`round ${step.round} observation`}
+              >
+                {JSON.stringify(step.observationMessage, null, 2)}
+              </AnnotatedJsonBlock>
+            ) : null}
+          </span>
+        ))}
+        {payload.finalResponsePayload ? (
+          <AnnotatedJsonBlock tone="purple" label="final response">
+            {JSON.stringify(payload.finalResponsePayload, null, 2)}
+          </AnnotatedJsonBlock>
+        ) : null}
+        <AnnotatedJsonBlock tone="green" label="final answer">
+          {JSON.stringify(payload.finalAnswer, null, 2)}
+        </AnnotatedJsonBlock>
+      </div>
+    </section>
+  );
+}
+
 function ToolCallsPackage({ trace }: { trace: TraceRun }) {
+  const reactResult = isReActResult(trace.requestPayload) ? trace.requestPayload : null;
   const requestPayload = isToolCallingRequestPayload(trace.requestPayload)
     ? trace.requestPayload
     : null;
@@ -917,6 +1241,48 @@ function ToolCallsPackage({ trace }: { trace: TraceRun }) {
     name: execution.name,
     content: execution.content,
   }));
+
+  if (reactResult) {
+    return (
+      <section className="full-package">
+        <header>
+          <span>ReAct Tool Calls</span>
+          <small>round-by-round action / execution / observation</small>
+        </header>
+        <div className="json-compose">
+          <AnnotatedJsonBlock tone="green" label="tool schemas">
+            {JSON.stringify(reactResult.toolDefinitions ?? [], null, 2)}
+          </AnnotatedJsonBlock>
+          {reactResult.reactSteps.map((step) => (
+            <span key={`react-tool-round-${step.round}`}>
+              <AnnotatedJsonBlock tone="warm" label={`round ${step.round} parsed action`}>
+                {JSON.stringify(
+                  {
+                    action: step.parsed.action,
+                    actionInput: step.parsed.actionInput,
+                    thought: step.parsed.thought,
+                    parseError: step.parsed.parseError,
+                  },
+                  null,
+                  2,
+                )}
+              </AnnotatedJsonBlock>
+              {step.toolExecution ? (
+                <AnnotatedJsonBlock tone="neutral" label={`round ${step.round} execution`}>
+                  {JSON.stringify(step.toolExecution, null, 2)}
+                </AnnotatedJsonBlock>
+              ) : null}
+              {step.observationMessage ? (
+                <AnnotatedJsonBlock tone="purple" label={`round ${step.round} observation`}>
+                  {JSON.stringify(step.observationMessage, null, 2)}
+                </AnnotatedJsonBlock>
+              ) : null}
+            </span>
+          ))}
+        </div>
+      </section>
+    );
+  }
 
   if (!requestPayload && trace.mode !== "tool-calling") {
     return (
