@@ -31,6 +31,15 @@ export type RuntimeMessage = {
   source: MessageSource;
 };
 
+export type ToolExecution = {
+  toolCall: ToolCall;
+  name: string;
+  arguments: unknown;
+  content: string;
+  ok: boolean;
+  error?: string;
+};
+
 export type TraceRun = {
   id: string;
   mode: AgentModeId;

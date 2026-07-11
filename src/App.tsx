@@ -12,10 +12,11 @@ import {
   Plus,
   SendHorizontal,
   Settings2,
+  Wrench,
 } from "lucide-react";
-import type { AgentModeId, RuntimeMessage, TraceRun } from "./types";
+import type { AgentModeId, RuntimeMessage, ToolExecution, TraceRun } from "./types";
 
-type InspectorTab = "input" | "output" | "memory" | "raw";
+type InspectorTab = "input" | "output" | "tools" | "memory" | "raw";
 
 type AgentModeOption = {
   id: AgentModeId;
@@ -31,16 +32,30 @@ type DeepSeekResult = {
   requestPayload: {
     model: string;
     temperature: number;
-    messages: Array<{ role: RuntimeMessage["role"]; content: string | null }>;
+    messages: Array<{
+      role: RuntimeMessage["role"];
+      content: string | null;
+      name?: string;
+      tool_call_id?: string;
+      tool_calls?: RuntimeMessage["tool_calls"];
+    }>;
   };
   responsePayload: {
     choices?: Array<{
       message?: {
         role?: RuntimeMessage["role"];
         content?: string | null;
+        tool_calls?: RuntimeMessage["tool_calls"];
       };
     }>;
   };
+};
+
+type ToolCallingResult = DeepSeekResult & {
+  toolDefinitions: unknown[];
+  toolExecutions: ToolExecution[];
+  followUpRequestPayload: DeepSeekResult["requestPayload"] | null;
+  followUpResponsePayload: DeepSeekResult["responsePayload"] | null;
 };
 
 const modeOptions: AgentModeOption[] = [
@@ -53,8 +68,8 @@ const modeOptions: AgentModeOption[] = [
   {
     id: "tool-calling",
     name: "Tool Calling",
-    description: "等待真实 tool runtime 接入后启用。",
-    enabled: false,
+    description: "真实 tool_call + 本地工具执行 + 二次 LLM 汇总。",
+    enabled: true,
   },
   {
     id: "react",
@@ -73,6 +88,7 @@ const modeOptions: AgentModeOption[] = [
 const tabs: Array<{ id: InspectorTab; label: string; icon: typeof SendHorizontal }> = [
   { id: "input", label: "Sent to LLM", icon: SendHorizontal },
   { id: "output", label: "LLM Response", icon: Inbox },
+  { id: "tools", label: "Tool Calls", icon: Wrench },
   { id: "memory", label: "Memory", icon: History },
   { id: "raw", label: "Raw Trace", icon: Layers3 },
 ];
@@ -88,16 +104,21 @@ const toRuntimeMessage = (
   id: string,
   role: RuntimeMessage["role"],
   content: string | null,
+  options: Pick<RuntimeMessage, "name" | "tool_call_id" | "tool_calls"> = {},
 ): RuntimeMessage => ({
   id,
   role,
   content,
   source: sourceForRole(role),
+  ...options,
 });
 
 const toApiMessage = (message: RuntimeMessage) => ({
   role: message.role,
   content: message.content ?? null,
+  ...(message.name ? { name: message.name } : {}),
+  ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
+  ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
 });
 
 const systemPromptMessage = (): RuntimeMessage =>
@@ -105,6 +126,13 @@ const systemPromptMessage = (): RuntimeMessage =>
     "system-prompt",
     "system",
     "You are a helpful assistant. Respond directly to the user prompt.",
+  );
+
+const toolCallingSystemPromptMessage = (): RuntimeMessage =>
+  toRuntimeMessage(
+    "tool-system-prompt",
+    "system",
+    "You are a helpful assistant. Use the provided tools when they can answer the user more accurately. After tool results are provided, explain the final answer directly and briefly.",
   );
 
 const buildTraceFromDeepSeek = (
@@ -156,6 +184,101 @@ const buildTraceFromDeepSeek = (
   };
 };
 
+const toRuntimeMessages = (
+  prefix: string,
+  messages: ToolCallingResult["requestPayload"]["messages"],
+) =>
+  messages.map((message, index) =>
+    toRuntimeMessage(`${prefix}-${index + 1}`, message.role, message.content, {
+      name: message.name,
+      tool_call_id: message.tool_call_id,
+      tool_calls: message.tool_calls,
+    }),
+  );
+
+const buildTraceFromToolCalling = (
+  prompt: string,
+  result: ToolCallingResult,
+  turnNumber: number,
+): TraceRun => {
+  const initialMessages = toRuntimeMessages("tool-request-initial", result.requestPayload.messages);
+  const currentUserIndex = initialMessages.reduce(
+    (latestIndex, message, index) => (message.role === "user" ? index : latestIndex),
+    -1,
+  );
+  const currentUserMessage = initialMessages[currentUserIndex];
+  const memoryMessages = initialMessages.filter(
+    (message, index) => message.role !== "system" && index !== currentUserIndex,
+  );
+  const firstAssistantPayload = result.responsePayload.choices?.[0]?.message ?? {
+    role: "assistant" as const,
+    content: null,
+  };
+  const toolCallMessage =
+    firstAssistantPayload.tool_calls && firstAssistantPayload.tool_calls.length > 0
+      ? toRuntimeMessage(`turn-${turnNumber}-assistant-tool-call`, "assistant", null, {
+          tool_calls: firstAssistantPayload.tool_calls,
+        })
+      : null;
+  const toolResultMessages = result.toolExecutions.map((execution, index) =>
+    toRuntimeMessage(`turn-${turnNumber}-tool-${index + 1}`, "tool", execution.content, {
+      name: execution.name,
+      tool_call_id: execution.toolCall.id,
+    }),
+  );
+  const finalResponsePayload = result.followUpResponsePayload ?? result.responsePayload;
+  const finalAssistantPayload =
+    finalResponsePayload.choices?.[0]?.message ?? firstAssistantPayload;
+  const finalAssistantContent = finalAssistantPayload.content ?? "";
+  const assistantMessage = toRuntimeMessage(
+    `turn-${turnNumber}-assistant-final`,
+    "assistant",
+    finalAssistantContent,
+    {
+      tool_calls:
+        result.toolExecutions.length === 0 ? finalAssistantPayload.tool_calls : undefined,
+    },
+  );
+  const conversationMessages = [
+    ...memoryMessages,
+    currentUserMessage,
+    toolCallMessage,
+    ...toolResultMessages,
+    assistantMessage,
+  ].filter(Boolean) as RuntimeMessage[];
+  const now = Date.now();
+
+  return {
+    id: `trace-${now}`,
+    mode: "tool-calling",
+    modeName: "Tool Calling",
+    description: "真实 DeepSeek tool_call 与本地工具执行生成的 trace。",
+    turnNumber,
+    userPrompt: prompt,
+    finalAnswer: finalAssistantContent,
+    temperature: result.requestPayload.temperature,
+    model: result.model,
+    durationMs: result.durationMs,
+    requestPayload: {
+      initialRequestPayload: result.requestPayload,
+      toolDefinitions: result.toolDefinitions,
+      toolExecutions: result.toolExecutions,
+      followUpRequestPayload: result.followUpRequestPayload,
+    },
+    responsePayload: {
+      initialResponsePayload: result.responsePayload,
+      toolExecutions: result.toolExecutions,
+      followUpResponsePayload: result.followUpResponsePayload,
+    },
+    requestMessages: result.followUpRequestPayload
+      ? toRuntimeMessages("tool-request-final", result.followUpRequestPayload.messages)
+      : initialMessages,
+    memoryMessages,
+    conversationMessages,
+    assistantMessage,
+  };
+};
+
 export function App() {
   const [activeMode, setActiveMode] = useState<AgentModeId>("basic");
   const [prompt, setPrompt] = useState("");
@@ -174,13 +297,14 @@ export function App() {
   const selectTrace = (trace: TraceRun) => {
     setActiveTraceId(trace.id);
     setActiveTab("input");
+    setActiveMode(trace.mode);
     setPrompt(trace.userPrompt);
     setConversationMessages(trace.conversationMessages);
   };
 
   const runTrace = async () => {
     const cleanPrompt = prompt.trim();
-    if (!cleanPrompt || isRunning || activeMode !== "basic") return;
+    if (!cleanPrompt || isRunning) return;
 
     setIsRunning(true);
     setError(null);
@@ -189,8 +313,12 @@ export function App() {
       const turnNumber =
         conversationMessages.filter((message) => message.role === "user").length + 1;
       const userMessage = toRuntimeMessage(`turn-${turnNumber}-user`, "user", cleanPrompt);
-      const requestMessages = [systemPromptMessage(), ...conversationMessages, userMessage];
-      const response = await fetch("/api/deepseek/chat", {
+      const systemMessage =
+        activeMode === "tool-calling" ? toolCallingSystemPromptMessage() : systemPromptMessage();
+      const requestMessages = [systemMessage, ...conversationMessages, userMessage];
+      const endpoint =
+        activeMode === "tool-calling" ? "/api/deepseek/tool-calling" : "/api/deepseek/chat";
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages: requestMessages.map(toApiMessage) }),
@@ -201,11 +329,10 @@ export function App() {
         throw new Error(payload.error ?? "DeepSeek request failed.");
       }
 
-      const trace = buildTraceFromDeepSeek(
-        cleanPrompt,
-        payload as DeepSeekResult,
-        turnNumber,
-      );
+      const trace =
+        activeMode === "tool-calling"
+          ? buildTraceFromToolCalling(cleanPrompt, payload as ToolCallingResult, turnNumber)
+          : buildTraceFromDeepSeek(cleanPrompt, payload as DeepSeekResult, turnNumber);
       setTraces((current) => [trace, ...current]);
       setConversationMessages(trace.conversationMessages);
       setActiveTraceId(trace.id);
@@ -351,9 +478,10 @@ function ChatPane({
   trace: TraceRun | null;
   visibleMessages: RuntimeMessage[];
 }) {
-  const chatMessages = visibleMessages.filter(
-    (message) => message.role === "user" || message.role === "assistant",
-  );
+  const chatMessages = visibleMessages.filter((message) => {
+    if (message.role === "user" || message.role === "tool") return true;
+    return message.role === "assistant" && (!!message.content || !!message.tool_calls?.length);
+  });
 
   return (
     <section className="chat-pane">
@@ -373,14 +501,35 @@ function ChatPane({
           chatMessages.map((message) => (
             <article
               className={`chat-message ${
-                message.role === "assistant" ? "assistant-message" : "user-message"
+                message.role === "assistant"
+                  ? "assistant-message"
+                  : message.role === "tool"
+                    ? "tool-message"
+                    : "user-message"
               }`}
               key={message.id}
             >
               <div className="message-author">
-                {message.role === "assistant" ? "Assistant" : "You"}
+                {message.role === "assistant"
+                  ? "Assistant"
+                  : message.role === "tool"
+                    ? `Tool${message.name ? ` · ${message.name}` : ""}`
+                    : "You"}
               </div>
-              <p>{message.content || "No content returned."}</p>
+              {message.tool_calls?.length ? (
+                <div className="tool-call-list">
+                  {message.tool_calls.map((toolCall) => (
+                    <span key={toolCall.id}>
+                      <Wrench size={14} />
+                      {toolCall.function.name}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              <p>
+                {message.content ||
+                  (message.tool_calls?.length ? "Waiting for tool results." : "No content returned.")}
+              </p>
             </article>
           ))
         ) : (
@@ -494,6 +643,10 @@ function InspectorPanel({ trace, tab }: { trace: TraceRun; tab: InspectorTab }) 
     return <FullOutputPackage trace={trace} />;
   }
 
+  if (tab === "tools") {
+    return <ToolCallsPackage trace={trace} />;
+  }
+
   if (tab === "memory") {
     return <MemoryPackage trace={trace} />;
   }
@@ -501,11 +654,43 @@ function InspectorPanel({ trace, tab }: { trace: TraceRun; tab: InspectorTab }) 
   return <RawTracePackage trace={trace} />;
 }
 
+type ToolCallingRequestPayload = {
+  initialRequestPayload?: unknown;
+  toolDefinitions?: unknown;
+  toolExecutions?: ToolExecution[];
+  followUpRequestPayload?: unknown;
+};
+
+type ToolCallingResponsePayload = {
+  initialResponsePayload?: unknown;
+  toolExecutions?: ToolExecution[];
+  followUpResponsePayload?: unknown;
+};
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === "object" && !Array.isArray(value);
+
+const isToolCallingRequestPayload = (value: unknown): value is ToolCallingRequestPayload =>
+  isRecord(value) && "initialRequestPayload" in value;
+
+const isToolCallingResponsePayload = (value: unknown): value is ToolCallingResponsePayload =>
+  isRecord(value) && "initialResponsePayload" in value;
+
 function FullInputPackage({ trace }: { trace: TraceRun }) {
+  if (isToolCallingRequestPayload(trace.requestPayload)) {
+    return <ToolCallingInputPackage payload={trace.requestPayload} />;
+  }
+
   const payload = trace.requestPayload as {
     model?: string;
     temperature?: number;
-    messages?: Array<{ role: RuntimeMessage["role"]; content: string | null }>;
+    messages?: Array<{
+      role: RuntimeMessage["role"];
+      content: string | null;
+      name?: string;
+      tool_call_id?: string;
+      tool_calls?: RuntimeMessage["tool_calls"];
+    }>;
   };
 
   return (
@@ -570,7 +755,40 @@ function FullInputPackage({ trace }: { trace: TraceRun }) {
   );
 }
 
+function ToolCallingInputPackage({
+  payload,
+}: {
+  payload: ToolCallingRequestPayload;
+}) {
+  return (
+    <section className="full-package">
+      <header>
+        <span>Tool Calling 输入链路</span>
+        <small>schema → tool result → final request</small>
+      </header>
+      <div className="json-compose">
+        <AnnotatedJsonBlock tone="warm" label="first request + tools">
+          {JSON.stringify(payload.initialRequestPayload, null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="green" label="available tool schemas">
+          {JSON.stringify(payload.toolDefinitions ?? [], null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="neutral" label="local tool execution">
+          {JSON.stringify(payload.toolExecutions ?? [], null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="purple" label="second request with tool results">
+          {JSON.stringify(payload.followUpRequestPayload ?? "No tool call requested.", null, 2)}
+        </AnnotatedJsonBlock>
+      </div>
+    </section>
+  );
+}
+
 function FullOutputPackage({ trace }: { trace: TraceRun }) {
+  if (isToolCallingResponsePayload(trace.responsePayload)) {
+    return <ToolCallingOutputPackage payload={trace.responsePayload} />;
+  }
+
   const responsePayload = trace.responsePayload as {
     choices?: Array<{
       message?: {
@@ -646,6 +864,96 @@ ${JSON.stringify(restChoice, null, 6)
   );
 }
 
+function ToolCallingOutputPackage({ payload }: { payload: ToolCallingResponsePayload }) {
+  return (
+    <section className="full-package">
+      <header>
+        <span>Tool Calling 输出链路</span>
+        <small className="purple-hint">tool_call → tool result → final answer</small>
+      </header>
+      <div className="json-compose">
+        <AnnotatedJsonBlock tone="warm" label="first model response">
+          {JSON.stringify(payload.initialResponsePayload, null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="green" label="tool results">
+          {JSON.stringify(payload.toolExecutions ?? [], null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="purple" label="final model response">
+          {JSON.stringify(
+            payload.followUpResponsePayload ?? payload.initialResponsePayload,
+            null,
+            2,
+          )}
+        </AnnotatedJsonBlock>
+      </div>
+    </section>
+  );
+}
+
+function ToolCallsPackage({ trace }: { trace: TraceRun }) {
+  const requestPayload = isToolCallingRequestPayload(trace.requestPayload)
+    ? trace.requestPayload
+    : null;
+  const responsePayload = isToolCallingResponsePayload(trace.responsePayload)
+    ? trace.responsePayload
+    : null;
+  const firstModelMessage = (
+    responsePayload?.initialResponsePayload as
+      | {
+          choices?: Array<{
+            message?: {
+              tool_calls?: RuntimeMessage["tool_calls"];
+            };
+          }>;
+        }
+      | undefined
+  )?.choices?.[0]?.message;
+  const toolExecutions = requestPayload?.toolExecutions ?? responsePayload?.toolExecutions ?? [];
+  const toolCalls =
+    firstModelMessage?.tool_calls ?? toolExecutions.map((execution) => execution.toolCall);
+  const toolResultMessages = toolExecutions.map((execution) => ({
+    role: "tool",
+    tool_call_id: execution.toolCall.id,
+    name: execution.name,
+    content: execution.content,
+  }));
+
+  if (!requestPayload && trace.mode !== "tool-calling") {
+    return (
+      <section className="full-package">
+        <header>
+          <span>Tool Calls</span>
+          <small>Basic LLM trace</small>
+        </header>
+        <div className="empty-panel">This trace did not attach tools or execute tool calls.</div>
+      </section>
+    );
+  }
+
+  return (
+    <section className="full-package">
+      <header>
+        <span>Tool Calling Detail</span>
+        <small>schema / call / execution / tool message</small>
+      </header>
+      <div className="json-compose">
+        <AnnotatedJsonBlock tone="green" label="tool schemas">
+          {JSON.stringify(requestPayload?.toolDefinitions ?? [], null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="warm" label="model tool_calls">
+          {JSON.stringify(toolCalls, null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="neutral" label="local executions">
+          {JSON.stringify(toolExecutions, null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="purple" label="role=tool messages">
+          {JSON.stringify(toolResultMessages, null, 2)}
+        </AnnotatedJsonBlock>
+      </div>
+    </section>
+  );
+}
+
 function MemoryPackage({ trace }: { trace: TraceRun }) {
   return (
     <section className="full-package">
@@ -659,12 +967,22 @@ function MemoryPackage({ trace }: { trace: TraceRun }) {
           const prefix = index === 0 ? "[\n" : "";
           const closing = index === trace.conversationMessages.length - 1 ? "]" : "";
           const label =
-            message.role === "user" ? "saved user prompt" : "saved assistant response";
-          const tone = message.role === "user" ? "green" : "purple";
+            message.role === "user"
+              ? "saved user prompt"
+              : message.role === "tool"
+                ? "saved tool result"
+                : message.tool_calls?.length
+                  ? "saved assistant tool call"
+                  : "saved assistant response";
+          const tone =
+            message.role === "user" ? "green" : message.role === "tool" ? "warm" : "purple";
           const messageJson = `  ${JSON.stringify(
             {
               role: message.role,
               content: message.content ?? null,
+              ...(message.name ? { name: message.name } : {}),
+              ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
+              ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
             },
             null,
             2,
