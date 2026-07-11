@@ -2,8 +2,23 @@
 
 > A visual runtime inspector for LLM agents — see every message, every payload, every turn.
 
-[![Stack](https://img.shields.io/badge/stack-React%2019%20%2B%20TypeScript%20%2B%20Vite-blue)](https://github.com/Tidenflow/AgentXRay)
-[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+<p align="center">
+  <a href="https://github.com/Tidenflow/AgentXRay">
+    <img alt="React" src="https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=white" />
+  </a>
+  <a href="https://github.com/Tidenflow/AgentXRay">
+    <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-5.x-3178C6?style=for-the-badge&logo=typescript&logoColor=white" />
+  </a>
+  <a href="https://github.com/Tidenflow/AgentXRay">
+    <img alt="Vite" src="https://img.shields.io/badge/Vite-6-646CFF?style=for-the-badge&logo=vite&logoColor=white" />
+  </a>
+  <a href="https://github.com/Tidenflow/AgentXRay">
+    <img alt="DeepSeek" src="https://img.shields.io/badge/LLM-DeepSeek-4B6BFB?style=for-the-badge&logo=openai&logoColor=white" />
+  </a>
+  <a href="./LICENSE">
+    <img alt="License" src="https://img.shields.io/badge/License-MIT-476B54?style=for-the-badge&logo=bookstack&logoColor=white" />
+  </a>
+</p>
 
 **AgentXRay** is a developer tool that turns the LLM Agent Runtime from a black box into an observable message pipeline.
 
