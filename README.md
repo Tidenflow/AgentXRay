@@ -73,13 +73,14 @@ AgentXRay visualizes every one of these hidden steps so you can answer:
 - [x] Multi-turn conversation memory
 - [x] Trace history with replay
 - [x] Vite dev-server proxy (no separate backend needed)
+- [x] **Tool Calling** mode with tool schema attachment, tool_call parsing, local tool execution, tool result append, and final LLM synthesis
 
 ### Roadmap
 
 | Phase | Mode | Description |
 |---|---|---|
 | ✅ Done | Basic LLM | Real DeepSeek request/response visualization |
-| 🚧 Next | **Tool Calling** | Tool schema builder, tool_call parser, tool executor, result append, second model request |
+| ✅ Done | **Tool Calling** | Tool schema builder, tool_call parser, tool executor, result append, second model request |
 | 📋 Planned | **ReAct** | Action/Observation loop, multi-turn message growth, max-round limit, final answer synthesis |
 | 📋 Planned | **Plan-and-Execute** | Planner → Executor → Synthesizer pipeline, plan-to-context flow visualization |
 
