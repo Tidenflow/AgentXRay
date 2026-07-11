@@ -14,7 +14,7 @@ import {
   Settings2,
   Wrench,
 } from "lucide-react";
-import type { AgentModeId, ReActStep, RuntimeMessage, ToolExecution, TraceRun } from "./types";
+import type { AgentModeId, PlanExecuteStep, ReActStep, RuntimeMessage, ToolExecution, TraceRun } from "./types";
 
 type InspectorTab = "input" | "output" | "tools" | "memory" | "raw";
 
@@ -73,6 +73,20 @@ type ReActResult = {
   maxRounds: number;
 };
 
+type PlanExecuteResult = {
+  baseUrl: string;
+  model: string;
+  durationMs: number;
+  plannerRequestPayload: unknown;
+  plannerResponsePayload: unknown;
+  plan: string[];
+  steps: PlanExecuteStep[];
+  synthesizerRequestPayload: unknown;
+  synthesizerResponsePayload: unknown;
+  finalAnswer: string;
+  toolDefinitions: unknown[];
+};
+
 const modeOptions: AgentModeOption[] = [
   {
     id: "basic",
@@ -95,8 +109,8 @@ const modeOptions: AgentModeOption[] = [
   {
     id: "plan-execute",
     name: "Plan-and-Execute",
-    description: "等待真实 planner / executor / synthesizer 接入后启用。",
-    enabled: false,
+    description: "Planner → Executor → Synthesizer 三阶段流水线，计划分解与逐步执行。",
+    enabled: true,
   },
 ];
 
@@ -172,6 +186,13 @@ Thought: <your final reasoning>
 Final Answer: <your concise answer to the user in natural language>
 
 Always start with a Thought. Use exactly ONE Action per response. Never output anything outside this format.`,
+  );
+
+const planExecuteSystemPromptMessage = (): RuntimeMessage =>
+  toRuntimeMessage(
+    "plan-execute-system-prompt",
+    "system",
+    "You are a helpful assistant. The runtime will handle planning and execution automatically.",
   );
 
 const buildTraceFromDeepSeek = (
@@ -376,6 +397,64 @@ const buildTraceFromReAct = (
   };
 };
 
+const buildTraceFromPlanExecute = (
+  prompt: string,
+  result: PlanExecuteResult,
+  turnNumber: number,
+): TraceRun => {
+  // Build request messages from planner payload
+  const plannerReq = result.plannerRequestPayload as {
+    messages?: Array<{ role: string; content: string | null }>;
+  };
+  const requestMessages =
+    plannerReq?.messages?.map((msg, i) =>
+      toRuntimeMessage(`plan-req-${i + 1}`, msg.role as RuntimeMessage["role"], msg.content),
+    ) ?? [];
+
+  const currentUserIndex = requestMessages.reduce(
+    (latestIndex, message, index) => (message.role === "user" ? index : latestIndex),
+    -1,
+  );
+  const currentUserMessage = requestMessages[currentUserIndex];
+  const memoryMessages = requestMessages.filter(
+    (message, index) => message.role !== "system" && index !== currentUserIndex,
+  );
+
+  const assistantMessage = toRuntimeMessage(
+    `turn-${turnNumber}-assistant`,
+    "assistant",
+    result.finalAnswer,
+  );
+
+  const conversationMessages = (
+    currentUserMessage
+      ? [...memoryMessages, currentUserMessage, assistantMessage]
+      : [assistantMessage]
+  ).filter(Boolean) as RuntimeMessage[];
+
+  const now = Date.now();
+
+  return {
+    id: `trace-${now}`,
+    mode: "plan-execute",
+    modeName: "Plan-and-Execute",
+    description: `Plan: ${result.plan.length} step(s), ${result.steps.length} executed.`,
+    turnNumber,
+    userPrompt: prompt,
+    finalAnswer: result.finalAnswer,
+    temperature:
+      (result.plannerRequestPayload as { temperature?: number })?.temperature ?? 0.7,
+    model: result.model,
+    durationMs: result.durationMs,
+    requestPayload: result,
+    responsePayload: result,
+    requestMessages,
+    memoryMessages,
+    conversationMessages,
+    assistantMessage,
+  };
+};
+
 export function App() {
   const [activeMode, setActiveMode] = useState<AgentModeId>("basic");
   const [prompt, setPrompt] = useState("");
@@ -416,11 +495,13 @@ export function App() {
           ? toolCallingSystemPromptMessage()
           : activeMode === "react"
             ? reactSystemPromptMessage()
-            : systemPromptMessage();
+            : activeMode === "plan-execute"
+              ? planExecuteSystemPromptMessage()
+              : systemPromptMessage();
 
-      // For ReAct, only carry forward user prompts + final assistant answers (no intermediate loop steps)
+      // For ReAct / Plan-Execute, only carry forward user prompts + final assistant answers
       const contextMessages =
-        activeMode === "react"
+        activeMode === "react" || activeMode === "plan-execute"
           ? conversationMessages.filter(
               (m) =>
                 m.role === "user" ||
@@ -435,7 +516,9 @@ export function App() {
           ? "/api/deepseek/tool-calling"
           : activeMode === "react"
             ? "/api/deepseek/react"
-            : "/api/deepseek/chat";
+            : activeMode === "plan-execute"
+              ? "/api/deepseek/plan-execute"
+              : "/api/deepseek/chat";
 
       const response = await fetch(endpoint, {
         method: "POST",
@@ -453,7 +536,9 @@ export function App() {
           ? buildTraceFromToolCalling(cleanPrompt, payload as ToolCallingResult, turnNumber)
           : activeMode === "react"
             ? buildTraceFromReAct(cleanPrompt, payload as ReActResult, turnNumber)
-            : buildTraceFromDeepSeek(cleanPrompt, payload as DeepSeekResult, turnNumber);
+            : activeMode === "plan-execute"
+              ? buildTraceFromPlanExecute(cleanPrompt, payload as PlanExecuteResult, turnNumber)
+              : buildTraceFromDeepSeek(cleanPrompt, payload as DeepSeekResult, turnNumber);
 
       setTraces((current) => [trace, ...current]);
       setConversationMessages(trace.conversationMessages);
@@ -606,6 +691,8 @@ function ChatPane({
   });
 
   const isReActTrace = trace?.mode === "react" && isReActResult(trace.requestPayload);
+  const isPlanExecuteTrace =
+    trace?.mode === "plan-execute" && isPlanExecuteResult(trace.requestPayload);
 
   return (
     <section className="chat-pane">
@@ -624,6 +711,11 @@ function ChatPane({
         {isReActTrace ? (
           <ReActChatView
             result={trace!.requestPayload as ReActResult}
+            userPrompt={trace!.userPrompt}
+          />
+        ) : isPlanExecuteTrace ? (
+          <PlanExecuteChatView
+            result={trace!.requestPayload as PlanExecuteResult}
             userPrompt={trace!.userPrompt}
           />
         ) : chatMessages.length > 0 ? (
@@ -808,6 +900,9 @@ const isToolCallingResponsePayload = (value: unknown): value is ToolCallingRespo
 const isReActResult = (value: unknown): value is ReActResult =>
   isRecord(value) && "reactSteps" in value && "finalAnswer" in value;
 
+const isPlanExecuteResult = (value: unknown): value is PlanExecuteResult =>
+  isRecord(value) && "plan" in value && "steps" in value && "plannerRequestPayload" in value;
+
 function ReActChatView({
   result,
   userPrompt,
@@ -898,9 +993,107 @@ function ReActChatView({
   );
 }
 
+function PlanExecuteChatView({
+  result,
+  userPrompt,
+}: {
+  result: PlanExecuteResult;
+  userPrompt: string;
+}) {
+  return (
+    <>
+      <article className="chat-message user-message">
+        <div className="message-author">You</div>
+        <p>{userPrompt}</p>
+      </article>
+
+      {/* Phase 1: Planner */}
+      <div className="plan-phase">
+        <div className="plan-phase-header">
+          <span className="plan-phase-badge phase-planner">Phase 1 · Planner</span>
+          <span className="plan-phase-summary">
+            Generated {result.plan.length} step{result.plan.length !== 1 ? "s" : ""}
+          </span>
+        </div>
+        <div className="plan-list">
+          {result.plan.map((step, index) => (
+            <div className="plan-step-item" key={`plan-step-${index}`}>
+              <span className="plan-step-num">{index + 1}</span>
+              <span>{step}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Phase 2: Executor */}
+      {result.steps.map((step) => (
+        <div className="plan-phase" key={`exec-step-${step.step}`}>
+          <div className="plan-phase-header">
+            <span className="plan-phase-badge phase-executor">Phase 2 · Step {step.step}</span>
+            <span className="plan-phase-summary">
+              {step.toolExecutions.length > 0
+                ? `${step.toolExecutions.length} tool call(s)`
+                : "direct reasoning"}
+            </span>
+          </div>
+
+          <div className="plan-exec-step-desc">{step.description}</div>
+
+          {step.toolExecutions.length > 0 && (
+            <div className="plan-exec-tools">
+              {step.toolExecutions.map((exec, i) => (
+                <div className="plan-exec-tool-item" key={`exec-${step.step}-${i}`}>
+                  <div className="plan-exec-tool-header">
+                    <Wrench size={13} />
+                    <code>{exec.name}</code>
+                    <span>{exec.ok ? "✅" : "❌"}</span>
+                  </div>
+                  <pre>{JSON.stringify(exec.arguments, null, 2)}</pre>
+                  <div className="plan-exec-tool-result">
+                    <span className="plan-exec-tool-label">Result</span>
+                    <pre>{exec.content}</pre>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="plan-exec-result">
+            <span className="plan-exec-result-label">Step Result</span>
+            <p>{step.stepResult || "(No result)"}</p>
+          </div>
+        </div>
+      ))}
+
+      {/* Phase 3: Synthesizer */}
+      <div className="plan-phase">
+        <div className="plan-phase-header">
+          <span className="plan-phase-badge phase-synthesizer">Phase 3 · Synthesizer</span>
+        </div>
+      </div>
+
+      {/* Final Answer */}
+      <article className="chat-message assistant-message">
+        <div className="message-author">Assistant (Synthesized Answer)</div>
+        <p>{result.finalAnswer}</p>
+      </article>
+
+      <div className="react-summary">
+        <span>
+          {result.plan.length} step(s) · {result.steps.length} executed · {result.durationMs}ms
+        </span>
+      </div>
+    </>
+  );
+}
+
 function FullInputPackage({ trace }: { trace: TraceRun }) {
   if (isReActResult(trace.requestPayload)) {
     return <ReActInputPackage payload={trace.requestPayload} />;
+  }
+
+  if (isPlanExecuteResult(trace.requestPayload)) {
+    return <PlanExecuteInputPackage payload={trace.requestPayload} />;
   }
 
   if (isToolCallingRequestPayload(trace.requestPayload)) {
@@ -1050,9 +1243,53 @@ function ReActInputPackage({ payload }: { payload: ReActResult }) {
   );
 }
 
+function PlanExecuteInputPackage({ payload }: { payload: PlanExecuteResult }) {
+  return (
+    <section className="full-package">
+      <header>
+        <span>Plan-and-Execute 输入链路</span>
+        <small>planner → per-step executor requests → synthesizer</small>
+      </header>
+      <div className="json-compose">
+        <AnnotatedJsonBlock tone="warm" label="planner request">
+          {JSON.stringify(payload.plannerRequestPayload, null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="green" label="tool definitions">
+          {JSON.stringify(payload.toolDefinitions ?? [], null, 2)}
+        </AnnotatedJsonBlock>
+        {payload.steps.map((step) => (
+          <span key={`pe-in-step-${step.step}`}>
+            <AnnotatedJsonBlock
+              tone="neutral"
+              label={`step ${step.step} executor request`}
+            >
+              {JSON.stringify(step.executorRequestPayload, null, 2)}
+            </AnnotatedJsonBlock>
+            {step.followUpRequestPayload ? (
+              <AnnotatedJsonBlock
+                tone="purple"
+                label={`step ${step.step} follow-up request (with tool results)`}
+              >
+                {JSON.stringify(step.followUpRequestPayload, null, 2)}
+              </AnnotatedJsonBlock>
+            ) : null}
+          </span>
+        ))}
+        <AnnotatedJsonBlock tone="purple" label="synthesizer request">
+          {JSON.stringify(payload.synthesizerRequestPayload, null, 2)}
+        </AnnotatedJsonBlock>
+      </div>
+    </section>
+  );
+}
+
 function FullOutputPackage({ trace }: { trace: TraceRun }) {
   if (isReActResult(trace.responsePayload)) {
     return <ReActOutputPackage payload={trace.responsePayload} />;
+  }
+
+  if (isPlanExecuteResult(trace.responsePayload)) {
+    return <PlanExecuteOutputPackage payload={trace.responsePayload} />;
   }
 
   if (isToolCallingResponsePayload(trace.responsePayload)) {
@@ -1213,8 +1450,68 @@ function ReActOutputPackage({ payload }: { payload: ReActResult }) {
   );
 }
 
+function PlanExecuteOutputPackage({ payload }: { payload: PlanExecuteResult }) {
+  return (
+    <section className="full-package">
+      <header>
+        <span>Plan-and-Execute 输出链路</span>
+        <small className="purple-hint">planner → executor steps → synthesizer → final answer</small>
+      </header>
+      <div className="json-compose">
+        <AnnotatedJsonBlock tone="warm" label="planner response (generated plan)">
+          {JSON.stringify(payload.plannerResponsePayload, null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="green" label="parsed plan">
+          {JSON.stringify(payload.plan, null, 2)}
+        </AnnotatedJsonBlock>
+        {payload.steps.map((step) => (
+          <span key={`pe-out-step-${step.step}`}>
+            <AnnotatedJsonBlock
+              tone="neutral"
+              label={`step ${step.step} executor response`}
+            >
+              {JSON.stringify(step.executorResponsePayload, null, 2)}
+            </AnnotatedJsonBlock>
+            {step.toolExecutions.length > 0 ? (
+              <AnnotatedJsonBlock
+                tone="green"
+                label={`step ${step.step} tool executions`}
+              >
+                {JSON.stringify(step.toolExecutions, null, 2)}
+              </AnnotatedJsonBlock>
+            ) : null}
+            {step.followUpResponsePayload ? (
+              <AnnotatedJsonBlock
+                tone="purple"
+                label={`step ${step.step} follow-up response`}
+              >
+                {JSON.stringify(step.followUpResponsePayload, null, 2)}
+              </AnnotatedJsonBlock>
+            ) : null}
+            <AnnotatedJsonBlock
+              tone="warm"
+              label={`step ${step.step} result`}
+            >
+              {JSON.stringify(step.stepResult, null, 2)}
+            </AnnotatedJsonBlock>
+          </span>
+        ))}
+        <AnnotatedJsonBlock tone="purple" label="synthesizer response">
+          {JSON.stringify(payload.synthesizerResponsePayload, null, 2)}
+        </AnnotatedJsonBlock>
+        <AnnotatedJsonBlock tone="green" label="final answer">
+          {JSON.stringify(payload.finalAnswer, null, 2)}
+        </AnnotatedJsonBlock>
+      </div>
+    </section>
+  );
+}
+
 function ToolCallsPackage({ trace }: { trace: TraceRun }) {
   const reactResult = isReActResult(trace.requestPayload) ? trace.requestPayload : null;
+  const planExecuteResult = isPlanExecuteResult(trace.requestPayload)
+    ? trace.requestPayload
+    : null;
   const requestPayload = isToolCallingRequestPayload(trace.requestPayload)
     ? trace.requestPayload
     : null;
@@ -1241,6 +1538,49 @@ function ToolCallsPackage({ trace }: { trace: TraceRun }) {
     name: execution.name,
     content: execution.content,
   }));
+
+  if (planExecuteResult) {
+    return (
+      <section className="full-package">
+        <header>
+          <span>Plan-and-Execute Tool Calls</span>
+          <small>per-step tool execution detail</small>
+        </header>
+        <div className="json-compose">
+          <AnnotatedJsonBlock tone="green" label="tool schemas">
+            {JSON.stringify(planExecuteResult.toolDefinitions ?? [], null, 2)}
+          </AnnotatedJsonBlock>
+          {planExecuteResult.steps.map((step) => (
+            <span key={`pe-tool-step-${step.step}`}>
+              <AnnotatedJsonBlock
+                tone="warm"
+                label={`step ${step.step} — ${step.description}`}
+              >
+                {JSON.stringify(
+                  {
+                    step: step.step,
+                    description: step.description,
+                    toolExecutions: step.toolExecutions,
+                    stepResult: step.stepResult,
+                  },
+                  null,
+                  2,
+                )}
+              </AnnotatedJsonBlock>
+              {step.toolExecutions.length > 0 ? (
+                <AnnotatedJsonBlock
+                  tone="neutral"
+                  label={`step ${step.step} tool executions (${step.toolExecutions.length})`}
+                >
+                  {JSON.stringify(step.toolExecutions, null, 2)}
+                </AnnotatedJsonBlock>
+              ) : null}
+            </span>
+          ))}
+        </div>
+      </section>
+    );
+  }
 
   if (reactResult) {
     return (

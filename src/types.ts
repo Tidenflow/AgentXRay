@@ -61,6 +61,18 @@ export type ReActStep = {
   responsePayload: unknown;
 };
 
+export type PlanExecuteStep = {
+  step: number;
+  description: string;
+  executorSystemPrompt: string;
+  executorRequestPayload: unknown;
+  executorResponsePayload: unknown;
+  toolExecutions: ToolExecution[];
+  followUpRequestPayload: unknown | null;
+  followUpResponsePayload: unknown | null;
+  stepResult: string;
+};
+
 export type TraceRun = {
   id: string;
   mode: AgentModeId;

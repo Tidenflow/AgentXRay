@@ -67,6 +67,18 @@ type ReActStep = {
   responsePayload: unknown;
 };
 
+type PlanExecuteStep = {
+  step: number;
+  description: string;
+  executorSystemPrompt: string;
+  executorRequestPayload: unknown;
+  executorResponsePayload: unknown;
+  toolExecutions: ToolExecution[];
+  followUpRequestPayload: unknown | null;
+  followUpResponsePayload: unknown | null;
+  stepResult: string;
+};
+
 const readBody = async (req: IncomingMessage) =>
   new Promise<string>((resolve, reject) => {
     let body = "";
@@ -408,6 +420,174 @@ Continue the ReAct loop. If the observation is enough, respond with "Final Answe
 const finalAnswerFromContent = (content: string) =>
   content.match(/Final Answer\s*:\s*([\s\S]*)/i)?.[1]?.trim() ?? content.trim();
 
+const plannerSystemPrompt = `You are a planner. Break the user's task into a sequence of concrete, executable steps. Each step must be a single well-defined action that can be accomplished with the available tools (calculate, get_current_datetime) or through reasoning. Do NOT solve the task yourself — only produce the plan.
+
+Output ONLY a JSON object with this exact structure (no other text):
+{
+  "plan": [
+    "Step 1 description",
+    "Step 2 description"
+  ]
+}`;
+
+const executorSystemPrompt = (stepDescription: string, plan: string[], originalTask: string) =>
+  `You are an executor. Execute the current step of the plan using the available tools when necessary. After receiving tool results, provide a concise step result.
+
+Original task: ${originalTask}
+
+Full plan:
+${plan.map((s, i) => `${i + 1}. ${s}`).join("\n")}
+
+Current step: ${stepDescription}
+
+Use tools if this step requires computation or data lookup. When done, state your result clearly.`;
+
+const synthesizerSystemPrompt = (originalTask: string, plan: string[], stepResults: string[]) =>
+  `You are a synthesizer. Based on the original task, the execution plan, and the results of each step, produce a comprehensive final answer. Combine all step results into a single coherent response.
+
+Original task: ${originalTask}
+
+Plan and results:
+${plan.map((s, i) => `Step ${i + 1}: ${s}\nResult: ${stepResults[i] ?? "Not completed"}`).join("\n\n")}
+
+Now produce the final answer for the user.`;
+
+const extractJsonObjectFromText = (text: string): Record<string, unknown> | null => {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) return null;
+
+  try {
+    const candidate = text.slice(start, end + 1);
+    const parsed = JSON.parse(candidate) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+};
+
+const parsePlan = (content: string): string[] => {
+  const json = extractJsonObjectFromText(content);
+  if (json && Array.isArray(json.plan)) {
+    return json.plan.filter((s): s is string => typeof s === "string" && s.trim().length > 0);
+  }
+
+  // Fallback: try to extract numbered list from text
+  const lines = content.split("\n").filter((line) => /^\d+[.)]\s*/.test(line.trim()));
+  if (lines.length > 0) {
+    return lines.map((line) => line.replace(/^\d+[.)]\s*/, "").trim()).filter(Boolean);
+  }
+
+  // Last resort: treat the entire content as a single-step plan
+  return [content.trim()];
+};
+
+const executePlanStep = async (
+  stepDescription: string,
+  plan: string[],
+  originalTask: string,
+  stepIndex: number,
+  temperature: number,
+  runChatCompletion: (payload: unknown) => Promise<{
+    ok: boolean;
+    status: number;
+    responsePayload: unknown;
+  }>,
+  model: string,
+): Promise<{
+  requestPayload: unknown;
+  responsePayload: unknown;
+  toolExecutions: ToolExecution[];
+  followUpRequestPayload: unknown | null;
+  followUpResponsePayload: unknown | null;
+  stepResult: string;
+}> => {
+  const systemPrompt = executorSystemPrompt(stepDescription, plan, originalTask);
+  const requestPayload = {
+    model,
+    temperature,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: `Execute step ${stepIndex + 1}: ${stepDescription}` },
+    ],
+    tools: localToolDefinitions,
+    tool_choice: "auto" as const,
+  };
+
+  const completion = await runChatCompletion(requestPayload);
+
+  if (!completion.ok) {
+    return {
+      requestPayload,
+      responsePayload: completion.responsePayload,
+      toolExecutions: [],
+      followUpRequestPayload: null,
+      followUpResponsePayload: null,
+      stepResult: "",
+    };
+  }
+
+  const assistantMessage = (
+    completion.responsePayload as {
+      choices?: Array<{ message?: ChatMessage }>;
+    } | null
+  )?.choices?.[0]?.message;
+  const toolCalls = assistantMessage?.tool_calls ?? [];
+  const toolExecutions = toolCalls.map(executeLocalTool);
+  const toolResultMessages = toolExecutions.map(createToolResultMessage);
+
+  if (toolResultMessages.length === 0) {
+    return {
+      requestPayload,
+      responsePayload: completion.responsePayload,
+      toolExecutions: [],
+      followUpRequestPayload: null,
+      followUpResponsePayload: null,
+      stepResult: assistantMessage?.content ?? "",
+    };
+  }
+
+  // Follow-up: send tool results back and get final step result
+  const followUpMessages = assistantMessage
+    ? [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `Execute step ${stepIndex + 1}: ${stepDescription}` },
+        assistantMessage,
+        ...toolResultMessages,
+      ]
+    : [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: `Execute step ${stepIndex + 1}: ${stepDescription}` },
+        ...toolResultMessages,
+      ];
+
+  const followUpRequestPayload = {
+    model,
+    temperature,
+    messages: followUpMessages,
+  };
+  const followUp = await runChatCompletion(followUpRequestPayload);
+
+  const stepResult =
+    (
+      followUp.responsePayload as {
+        choices?: Array<{ message?: { content?: string | null } }>;
+      } | null
+    )?.choices?.[0]?.message?.content ?? "";
+
+  return {
+    requestPayload,
+    responsePayload: completion.responsePayload,
+    toolExecutions,
+    followUpRequestPayload,
+    followUpResponsePayload: followUp.responsePayload,
+    stepResult: (stepResult || assistantMessage?.content) ?? "",
+  };
+};
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
   const baseUrl = env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
@@ -742,6 +922,167 @@ export default defineConfig(({ mode }) => {
                 finalResponsePayload,
                 finalAnswer,
                 maxRounds,
+              });
+            } catch (error) {
+              sendJson(res, 500, {
+                error: error instanceof Error ? error.message : "Unknown DeepSeek proxy error.",
+              });
+            }
+          });
+
+          server.middlewares.use("/api/deepseek/plan-execute", async (req, res, next) => {
+            if (req.method !== "POST") {
+              next();
+              return;
+            }
+
+            if (!env.DEEPSEEK_API_KEY) {
+              sendJson(res, 500, {
+                error: "Missing DEEPSEEK_API_KEY. Add it to .env before running a trace.",
+              });
+              return;
+            }
+
+            try {
+              const body = JSON.parse((await readBody(req)) || "{}") as ChatRequest;
+              const messages = readChatMessages(body);
+
+              if (messages.length === 0) {
+                sendJson(res, 400, { error: "Messages or prompt are required." });
+                return;
+              }
+
+              const temperature = body.temperature ?? defaultTemperature;
+              const startedAt = Date.now();
+
+              // Extract the user's original task (last user message or first non-system content)
+              const userMessages = messages.filter((m) => m.role === "user");
+              const originalTask =
+                userMessages.length > 0
+                  ? (userMessages[userMessages.length - 1].content ?? "")
+                  : (messages.find((m) => m.content)?.content ?? "");
+
+              // ---- Phase 1: Planner ----
+              const plannerRequestPayload = {
+                model,
+                temperature,
+                messages: [
+                  { role: "system" as const, content: plannerSystemPrompt },
+                  { role: "user" as const, content: originalTask },
+                ],
+              };
+              const plannerCompletion = await runChatCompletion(plannerRequestPayload);
+
+              if (!plannerCompletion.ok) {
+                sendJson(res, plannerCompletion.status, {
+                  error: "DeepSeek planner request failed.",
+                  plannerRequestPayload,
+                  plannerResponsePayload: plannerCompletion.responsePayload,
+                  status: plannerCompletion.status,
+                });
+                return;
+              }
+
+              const plannerContent =
+                (
+                  plannerCompletion.responsePayload as {
+                    choices?: Array<{ message?: { content?: string | null } }>;
+                  } | null
+                )?.choices?.[0]?.message?.content ?? "";
+              const plan = parsePlan(plannerContent);
+
+              // ---- Phase 2: Executor (one call per plan step) ----
+              const steps: PlanExecuteStep[] = [];
+
+              for (let i = 0; i < plan.length; i += 1) {
+                const stepDescription = plan[i];
+                const execResult = await executePlanStep(
+                  stepDescription,
+                  plan,
+                  originalTask,
+                  i,
+                  temperature,
+                  runChatCompletion,
+                  model,
+                );
+
+                steps.push({
+                  step: i + 1,
+                  description: stepDescription,
+                  executorSystemPrompt: executorSystemPrompt(stepDescription, plan, originalTask),
+                  executorRequestPayload: execResult.requestPayload,
+                  executorResponsePayload: execResult.responsePayload,
+                  toolExecutions: execResult.toolExecutions,
+                  followUpRequestPayload: execResult.followUpRequestPayload,
+                  followUpResponsePayload: execResult.followUpResponsePayload,
+                  stepResult: execResult.stepResult,
+                });
+
+                // If any step fails, continue but note it
+                if (!execResult.stepResult && execResult.toolExecutions.length === 0) {
+                  steps[steps.length - 1].stepResult =
+                    `[Step ${i + 1} could not be completed — model returned no content]`;
+                }
+              }
+
+              // ---- Phase 3: Synthesizer ----
+              const stepResults = steps.map((s) => s.stepResult);
+              const synthesizerRequestPayload = {
+                model,
+                temperature,
+                messages: [
+                  {
+                    role: "system" as const,
+                    content: synthesizerSystemPrompt(originalTask, plan, stepResults),
+                  },
+                  {
+                    role: "user" as const,
+                    content: "Produce the final answer based on the plan and results above.",
+                  },
+                ],
+              };
+              const synthesizerCompletion = await runChatCompletion(synthesizerRequestPayload);
+
+              const finalAnswer =
+                (
+                  synthesizerCompletion.responsePayload as {
+                    choices?: Array<{ message?: { content?: string | null } }>;
+                  } | null
+                )?.choices?.[0]?.message?.content ?? "";
+
+              if (!synthesizerCompletion.ok) {
+                // Even if synthesizer fails, return what we have
+                sendJson(res, 200, {
+                  baseUrl,
+                  model,
+                  durationMs: Date.now() - startedAt,
+                  plannerRequestPayload,
+                  plannerResponsePayload: plannerCompletion.responsePayload,
+                  plan,
+                  steps,
+                  synthesizerRequestPayload,
+                  synthesizerResponsePayload: synthesizerCompletion.responsePayload,
+                  finalAnswer: finalAnswer || "Synthesis failed. See step results for details.",
+                  toolDefinitions: localToolDefinitions,
+                  error: synthesizerCompletion.responsePayload
+                    ? "Synthesizer returned an error. Step results are available."
+                    : undefined,
+                });
+                return;
+              }
+
+              sendJson(res, 200, {
+                baseUrl,
+                model,
+                durationMs: Date.now() - startedAt,
+                plannerRequestPayload,
+                plannerResponsePayload: plannerCompletion.responsePayload,
+                plan,
+                steps,
+                synthesizerRequestPayload,
+                synthesizerResponsePayload: synthesizerCompletion.responsePayload,
+                finalAnswer,
+                toolDefinitions: localToolDefinitions,
               });
             } catch (error) {
               sendJson(res, 500, {
