@@ -20,7 +20,32 @@
   </a>
 </p>
 
-**AgentXRay** is a developer tool that turns the LLM Agent Runtime from a black box into an observable message pipeline.
+---
+
+## Table of Contents
+
+- [Why AgentXRay](#why-agentxray)
+- [Supported Agent Modes](#supported-agent-modes)
+- [Try It — Example Prompts](#try-it--example-prompts)
+- [Mode Comparison](#mode-comparison)
+- [Architecture](#architecture)
+- [How It Works](#how-it-works)
+- [Screenshots](#screenshots)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Tech Stack](#tech-stack)
+- [Design Principles](#design-principles)
+- [Project Structure](#project-structure)
+- [MVP Status](#mvp-status)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+
+---
+
+## Why AgentXRay
 
 Most AI chat products only show:
 
@@ -45,7 +70,7 @@ User Prompt
 → final assistant answer
 ```
 
-AgentXRay visualizes every one of these hidden steps so you can answer:
+**AgentXRay** turns this black box into an observable message pipeline. Whether you're debugging why your agent hallucinated a tool call, tracing how context accumulates across ReAct rounds, or just curious what a Plan-and-Execute planner actually generates — AgentXRay gives you the X-ray vision to answer:
 
 > *"What exactly did the Agent send to the model — and what did it get back?"*
 
@@ -53,7 +78,7 @@ AgentXRay visualizes every one of these hidden steps so you can answer:
 
 ## Supported Agent Modes
 
-AgentXRay implements four agent architectures, each revealing a different layer of the runtime message pipeline:
+AgentXRay implements four agent architectures, each revealing a different layer of the runtime message pipeline.
 
 ### 1. Basic LLM
 
@@ -83,10 +108,11 @@ User Prompt
 **Inspector reveals:** tool schema attachment, the `tool_calls` in the model response, local execution results, role=tool message construction, and the follow-up request that merges tool results back into context.
 
 **Available tools:**
-| Tool | Description |
-|---|---|
-| `calculate` | Evaluate arithmetic expressions (`+`, `-`, `*`, `/`, `%`, `^`, parentheses) |
-| `get_current_datetime` | Get current date/time for any IANA timezone |
+
+| Tool | Parameter | Type | Description |
+|---|---|---|---|
+| `calculate` | `expression` | `string` | Evaluate arithmetic — `+`, `-`, `*`, `/`, `%`, `^`, parentheses, decimals |
+| `get_current_datetime` | `timezone` | `string` *(optional)* | Get current date & time for an IANA timezone (e.g. `Asia/Shanghai`, `America/New_York`) |
 
 ### 3. ReAct (Reasoning + Acting)
 
@@ -120,6 +146,160 @@ User Prompt
 
 ---
 
+## Try It — Example Prompts
+
+Here are prompts designed to exercise each mode so you can see the trace inspector in action.
+
+### Basic LLM
+
+```
+What's the difference between Fahrenheit and Celsius?
+```
+
+→ **Watch:** Single request/response. Check the **Sent to LLM** tab to see how the system prompt and user message are assembled. Switch to **Memory** to see the conversation snapshot.
+
+### Tool Calling
+
+```
+If I invest $10,000 at 7% annual return compounded yearly for 20 years, what will it be worth? Use the calculate tool for the math.
+```
+
+→ **Watch:** The model issues a `calculate` tool call with `10000 * (1 + 0.07) ^ 20`. Check the **Tool Calls** tab to see the tool schema, the model's `tool_calls` JSON, the local execution result, and the follow-up request that feeds the result back to the model.
+
+```
+What time is it in Tokyo right now? And what's the date in New York?
+```
+
+→ **Watch:** Multiple tool calls in one turn. The model may call `get_current_datetime` twice. The **Sent to LLM** tab shows how tool results become `role=tool` messages in the follow-up request.
+
+### ReAct
+
+```
+If a train leaves Station A at 60 mph and another leaves Station B at 80 mph, 300 miles apart, when do they meet? Use the calculate tool to check your math.
+```
+
+→ **Watch:** The model writes `Thought:`, `Action: calculate`, `Action Input: {"expression": "300/(60+80)"}`. The runtime executes the tool and appends an `Observation:`. The **LLM Response** tab shows the parsed Thought/Action/Observation for each round. See how the message stack grows across rounds in **Memory**.
+
+```
+What is the date and time in Shanghai, and how many hours remain until next Friday?
+```
+
+→ **Watch:** Multi-tool ReAct loop — `get_current_datetime` then `calculate` on the result.
+
+### Plan-and-Execute
+
+```
+Compare the population density of Tokyo, London, and New York City. For each city, include approximate population and area.
+```
+
+→ **Watch:** The **Planner** generates a step list (e.g., "1. Look up Tokyo population and area, 2. Look up London..., 3. Look up NYC..., 4. Calculate densities, 5. Compare"). Each step runs independently with its own tool calls. The **Synthesizer** merges all step results into a final comparison. Check **LLM Response** to see the planner output, each executor response, and the synthesizer's final assembly.
+
+---
+
+## Mode Comparison
+
+| Dimension | Basic LLM | Tool Calling | ReAct | Plan-and-Execute |
+|---|---|---|---|---|
+| **Model calls per turn** | 1 | 1–2 | 2–9 | 2 + N steps |
+| **Tool execution** | No | Yes (local) | Yes (local) | Yes (per step) |
+| **Message growth** | +2 / turn | +2–5 / turn | +3 per round | +2 per step |
+| **Best for inspecting** | Request/response shape | Tool schema & result merging | Multi-turn reasoning loops | Task decomposition pipelines |
+| **Max rounds/steps** | N/A | N/A | 8 (default 4) | Unlimited |
+| **Temperature configurable** | Yes | Yes | Yes | Yes |
+
+---
+
+## Architecture
+
+AgentXRay runs entirely in the browser with a Vite dev-server proxy — no separate backend process.
+
+```
+┌─────────────┐     ┌─────────────────────────────┐     ┌──────────────────┐
+│   Browser   │────▶│   Vite Dev Server (:5173)    │────▶│  DeepSeek API    │
+│             │     │                             │     │  api.deepseek.com│
+│  React App  │     │  /api/deepseek/chat          │     │                  │
+│  (Trace UI) │◀────│  /api/deepseek/tool-calling  │◀────│  /v1/chat/       │
+│             │     │  /api/deepseek/react          │     │   completions    │
+│             │     │  /api/deepseek/plan-execute   │     │                  │
+└─────────────┘     └─────────────────────────────┘     └──────────────────┘
+```
+
+### Data Flow
+
+Each agent mode follows the same trace pipeline:
+
+```
+1. User types a prompt
+         │
+2. App.tsx builds mode-specific request body
+   (system prompt, messages, tools, maxRounds...)
+         │
+3. Vite proxy forwards to DeepSeek API
+   (API key injected server-side, never reaches browser)
+         │
+4. Proxy executes local tools (calculate, get_current_datetime)
+   when the model returns tool_calls
+         │
+5. Proxy returns a unified result object
+   (request payload, response payload, tool executions, duration)
+         │
+6. App.tsx trace builder constructs a TraceRun
+   - Extracts memory messages (all non-system, non-current-user messages)
+   - Tags each message with its source (user_input | system_prompt | model_response | tool_result | planner | executor | synthesizer)
+   - Assembles color-coded conversation history
+         │
+7. Inspector tabs render the TraceRun
+   Sent to LLM │ LLM Response │ Tool Calls │ Memory │ Raw Trace
+```
+
+### API Proxy Endpoints
+
+| Endpoint | Method | Key Request Fields | Returns |
+|---|---|---|---|
+| `/api/deepseek/chat` | POST | `prompt`, `temperature` | `DeepSeekResult` — request/response payloads, model, duration |
+| `/api/deepseek/tool-calling` | POST | `prompt`, `temperature` | `ToolCallingResult` — extends DeepSeekResult with `toolDefinitions`, `toolExecutions`, `followUpRequestPayload` |
+| `/api/deepseek/react` | POST | `prompt`, `temperature`, `maxRounds` | `ReActResult` — `reactSteps[]` with per-round parsed Thought/Action/Observation |
+| `/api/deepseek/plan-execute` | POST | `prompt`, `temperature` | `PlanExecuteResult` — `plan[]`, `steps[]` with per-step tool executions |
+
+All endpoints share the same DeepSeek configuration from `.env`. The proxy:
+- Strips `reasoning_content` from model responses (hidden reasoning is outside runtime inspection scope)
+- Handles tool execution locally — no external tool server needed
+- Measures and returns `durationMs` for every call
+
+### Key Data Types
+
+**`RuntimeMessage`** — every message in the pipeline carries a `source` tag:
+
+```typescript
+type MessageSource =
+  | "user_input"       // typed by the user
+  | "system_prompt"    // injected by the runtime
+  | "agent_runtime"    // constructed by the agent loop
+  | "model_response"   // returned by the LLM
+  | "tool_result"      // produced by local tool execution
+  | "planner"          // Plan-and-Execute phase 1
+  | "executor"         // Plan-and-Execute phase 2
+  | "synthesizer";     // Plan-and-Execute phase 3
+```
+
+**`TraceRun`** — a complete trace record:
+
+```typescript
+{
+  id, mode, modeName,         // identity
+  turnNumber, userPrompt,     // input
+  finalAnswer, durationMs,    // output
+  requestPayload,             // what was sent
+  responsePayload,            // what came back
+  requestMessages,            // current-turn messages
+  memoryMessages,             // carried forward from previous turns
+  conversationMessages,       // full conversation (memory + current + assistant)
+  assistantMessage            // the model's final response
+}
+```
+
+---
+
 ## How It Works
 
 ```
@@ -134,7 +314,7 @@ User Prompt
 ```
 
 - **Chat Pane** — the normal chat experience. Type a prompt, get a reply. Mode-specific rendering shows ReAct rounds and Plan-and-Execute phases inline.
-- **Trace Inspector** — the X-ray. Four annotated JSON views reveal exactly what the runtime constructed, sent, received, and remembered.
+- **Trace Inspector** — the X-ray. Five annotated JSON views reveal exactly what the runtime constructed, sent, received, and remembered.
 - **Sidebar** — switch between agent modes, start fresh traces, and browse trace history with replay.
 
 ### Inspector Tabs
@@ -149,19 +329,18 @@ User Prompt
 
 ---
 
-## MVP Status
+## Screenshots
 
-All four agent modes are fully implemented with real DeepSeek API calls and annotated trace visualization:
+> **Coming soon.** Clone the repo and run `npm run dev` to see it live — it takes under a minute to get going.
 
-- [x] Three-column UI (Sidebar / Chat / Inspector)
-- [x] **Basic LLM** — real DeepSeek request/response visualization
-- [x] **Tool Calling** — tool schema builder, tool_call parser, tool executor, result append, second model request
-- [x] **ReAct** — Action/Observation loop, multi-turn message growth, max-round limit, final answer synthesis
-- [x] **Plan-and-Execute** — Planner → Executor → Synthesizer pipeline, per-step tool execution, plan-to-context flow
-- [x] Annotated JSON viewers for request, response, memory, and raw trace
-- [x] Multi-turn conversation memory
-- [x] Trace history with replay
-- [x] Vite dev-server proxy (no separate backend needed)
+If you'd like to contribute screenshots, see [Contributing](#contributing).
+
+---
+
+## Prerequisites
+
+- **Node.js** >= 18
+- **DeepSeek API key** — get one at [platform.deepseek.com](https://platform.deepseek.com)
 
 ---
 
@@ -190,13 +369,35 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_TEMPERATURE=0.7
 ```
 
-### 3. Run
+### 3. Run the dev server
 
 ```bash
 npm run dev
 ```
 
 Open `http://localhost:5173`, select an agent mode, type a prompt, and watch the trace inspector light up.
+
+### 4. (Optional) Build for production
+
+```bash
+npm run build
+npm run preview
+```
+
+---
+
+## Configuration
+
+All configuration lives in `.env` (copy from `.env.example`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | *(required)* | Your DeepSeek API key |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API base URL — change for proxies or OpenAI-compatible providers |
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash` | `deepseek-v4-flash` for speed, `deepseek-v4-pro` for quality |
+| `DEEPSEEK_TEMPERATURE` | `0.7` | Sampling temperature (0.0–2.0) |
+
+The Vite dev server proxies all `/api/deepseek/*` calls server-side, so your API key never reaches the browser.
 
 ---
 
@@ -206,13 +407,13 @@ Open `http://localhost:5173`, select an agent mode, type a prompt, and watch the
 |---|---|
 | Frontend | React 19 + TypeScript |
 | Build | Vite 6 |
-| State | React `useState` (component-local) |
+| State | Zustand (trace history persistence) + React `useState` (component-local) |
 | Icons | Lucide React |
-| Styling | Plain CSS (warm palette, three-column CSS Grid) |
+| Styling | Plain CSS (warm palette, three-column CSS Grid, min-width 1180px) |
 | API Proxy | Vite dev-server middleware (`/api/deepseek/*`) |
 | LLM | DeepSeek (configurable base URL & model) |
 
-No separate backend. The Vite dev server proxies API calls so you never leak your key to the browser.
+No separate backend. The Vite dev server proxies API calls so your API key never leaks to the browser.
 
 ---
 
@@ -225,6 +426,7 @@ The central question is not *"Which agent is faster?"* — it's:
 > *"What exactly happened to the messages?"*
 
 Every view in AgentXRay answers one slice of that question:
+
 - **Sent to LLM** → what went *in*
 - **LLM Response** → what came *back*
 - **Memory** → what will be carried *forward*
@@ -245,27 +447,89 @@ Request/response payload ✅
 Hidden reasoning ❌ (outside runtime inspection scope)
 ```
 
+> The proxy actively redacts `reasoning_content` from model responses — that's the model's private scratchpad, not part of the runtime's observable surface.
+
 ---
 
 ## Project Structure
 
 ```
-src/
-├── App.tsx       # Main application — components, state, trace builders, inspector panels
-├── types.ts      # TypeScript type definitions (AgentModeId, RuntimeMessage, TraceRun, etc.)
-├── main.tsx      # React entry point
-├── styles.css    # Complete stylesheet
-docs/
-├── version1plan.md   # Original design document (Chinese)
-vite.config.ts    # Vite config + all DeepSeek API proxy middleware
-                  #   /api/deepseek/chat          — Basic LLM
-                  #   /api/deepseek/tool-calling   — Tool Calling
-                  #   /api/deepseek/react          — ReAct loop
-                  #   /api/deepseek/plan-execute   — Plan-and-Execute pipeline
+.
+├── index.html              # HTML entry point
+├── package.json            # Dependencies & scripts
+├── vite.config.ts          # Vite config + all DeepSeek API proxy middleware (1100+ lines)
+│                           #   /api/deepseek/chat          — Basic LLM
+│                           #   /api/deepseek/tool-calling   — Tool Calling
+│                           #   /api/deepseek/react          — ReAct loop
+│                           #   /api/deepseek/plan-execute   — Plan-and-Execute pipeline
+├── tsconfig.json           # TypeScript config
+├── .env.example            # Environment variable template
+├── src/
+│   ├── main.tsx            # React entry point
+│   ├── App.tsx             # Main application — UI components, state, trace builders, inspector panels (1700+ lines)
+│   ├── types.ts            # TypeScript type definitions (AgentModeId, RuntimeMessage, TraceRun, etc.)
+│   ├── styles.css          # Complete stylesheet (CSS Grid layout, warm palette, color-coded message roles)
+│   └── data/               # Static data / default traces
+└── docs/
+    └── version1plan.md     # Original design document (Chinese)
 ```
+
+---
+
+## MVP Status
+
+All four agent modes are fully implemented with real DeepSeek API calls and annotated trace visualization:
+
+- [x] Three-column UI (Sidebar / Chat / Inspector)
+- [x] **Basic LLM** — real DeepSeek request/response visualization
+- [x] **Tool Calling** — tool schema builder, tool_call parser, tool executor, result append, second model request
+- [x] **ReAct** — Action/Observation loop, multi-turn message growth, max-round limit, final answer synthesis
+- [x] **Plan-and-Execute** — Planner → Executor → Synthesizer pipeline, per-step tool execution, plan-to-context flow
+- [x] Annotated JSON viewers for request, response, memory, and raw trace
+- [x] Multi-turn conversation memory with cross-turn context persistence
+- [x] Trace history with replay (Zustand-powered persistence)
+- [x] Vite dev-server proxy — no separate backend needed
+
+---
+
+## Roadmap
+
+- [ ] **Multi-provider support** — OpenAI, Anthropic, and other compatible APIs
+- [ ] **Streaming visualization** — watch tokens arrive in real time in the trace inspector
+- [ ] **Screenshots & demo video**
+- [ ] **Dark mode**
+- [ ] **Export traces** — download a trace run as JSON for sharing and debugging
+- [ ] **Diff mode** — compare two trace runs side by side
+- [ ] **Custom tool definitions** — define and register tools from the UI
+
+---
+
+## Contributing
+
+Contributions are welcome! Here's how to get started:
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feat/my-feature`
+3. Make your changes
+4. Run the dev server and verify your changes work: `npm run dev`
+5. Commit using conventional commit messages: `feat: add ...`, `fix: ...`, `docs: ...`
+6. Push and open a Pull Request
+
+For larger changes, please open an issue first to discuss what you'd like to change.
+
+---
+
+## Acknowledgments
+
+AgentXRay is inspired by the need to understand what happens inside agent runtimes. The four agent modes are modeled after well-known patterns in the LLM agent literature:
+
+- **ReAct** — Yao et al., "[ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)" (2022)
+- **Plan-and-Execute** — a practical decomposition pattern widely used in agent frameworks like LangGraph, CrewAI, and AutoGPT
+
+Built with [React](https://react.dev), [Vite](https://vitejs.dev), and [DeepSeek](https://www.deepseek.com).
 
 ---
 
 ## License
 
-MIT
+[MIT](./LICENSE)
