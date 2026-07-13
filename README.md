@@ -20,7 +20,33 @@
   </a>
 </p>
 
-**AgentXRay** is a developer tool that turns the LLM Agent Runtime from a black box into an observable message pipeline.
+---
+
+## Table of Contents
+
+- [Why AgentXRay](#why-agentxray)
+- [Supported Agent Modes](#supported-agent-modes)
+  - [1. Basic LLM](#1-basic-llm)
+  - [2. Tool Calling](#2-tool-calling)
+  - [3. ReAct (Reasoning + Acting)](#3-react-reasoning--acting)
+  - [4. Plan-and-Execute](#4-plan-and-execute)
+- [How It Works](#how-it-works)
+- [Screenshots](#screenshots)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Tech Stack](#tech-stack)
+- [Design Principles](#design-principles)
+- [Project Structure](#project-structure)
+- [MVP Status](#mvp-status)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [Acknowledgments](#acknowledgments)
+- [License](#license)
+
+---
+
+## Why AgentXRay
 
 Most AI chat products only show:
 
@@ -45,7 +71,7 @@ User Prompt
 → final assistant answer
 ```
 
-AgentXRay visualizes every one of these hidden steps so you can answer:
+**AgentXRay** turns this black box into an observable message pipeline. Whether you're debugging why your agent hallucinated a tool call, tracing how context accumulates across ReAct rounds, or just curious what a Plan-and-Execute planner actually generates — AgentXRay gives you the X-ray vision to answer:
 
 > *"What exactly did the Agent send to the model — and what did it get back?"*
 
@@ -83,6 +109,7 @@ User Prompt
 **Inspector reveals:** tool schema attachment, the `tool_calls` in the model response, local execution results, role=tool message construction, and the follow-up request that merges tool results back into context.
 
 **Available tools:**
+
 | Tool | Description |
 |---|---|
 | `calculate` | Evaluate arithmetic expressions (`+`, `-`, `*`, `/`, `%`, `^`, parentheses) |
@@ -149,19 +176,18 @@ User Prompt
 
 ---
 
-## MVP Status
+## Screenshots
 
-All four agent modes are fully implemented with real DeepSeek API calls and annotated trace visualization:
+> **Coming soon.** We're working on screenshots and a demo video. In the meantime, clone the repo and run `npm run dev` to see it live — it takes under a minute to get going.
 
-- [x] Three-column UI (Sidebar / Chat / Inspector)
-- [x] **Basic LLM** — real DeepSeek request/response visualization
-- [x] **Tool Calling** — tool schema builder, tool_call parser, tool executor, result append, second model request
-- [x] **ReAct** — Action/Observation loop, multi-turn message growth, max-round limit, final answer synthesis
-- [x] **Plan-and-Execute** — Planner → Executor → Synthesizer pipeline, per-step tool execution, plan-to-context flow
-- [x] Annotated JSON viewers for request, response, memory, and raw trace
-- [x] Multi-turn conversation memory
-- [x] Trace history with replay
-- [x] Vite dev-server proxy (no separate backend needed)
+If you'd like to contribute screenshots, see [Contributing](#contributing).
+
+---
+
+## Prerequisites
+
+- **Node.js** >= 18 (or latest LTS)
+- **DeepSeek API key** — get one at [platform.deepseek.com](https://platform.deepseek.com)
 
 ---
 
@@ -190,13 +216,35 @@ DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_TEMPERATURE=0.7
 ```
 
-### 3. Run
+### 3. Run the dev server
 
 ```bash
 npm run dev
 ```
 
 Open `http://localhost:5173`, select an agent mode, type a prompt, and watch the trace inspector light up.
+
+### 4. (Optional) Build for production
+
+```bash
+npm run build
+npm run preview
+```
+
+---
+
+## Configuration
+
+All configuration lives in `.env` (copy from `.env.example`):
+
+| Variable | Default | Description |
+|---|---|---|
+| `DEEPSEEK_API_KEY` | *(required)* | Your DeepSeek API key |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API base URL — change for proxies or compatible providers |
+| `DEEPSEEK_MODEL` | `deepseek-v4-flash` | Model to use. `deepseek-v4-flash` for speed, `deepseek-v4-pro` for quality |
+| `DEEPSEEK_TEMPERATURE` | `0.7` | Sampling temperature (0.0–2.0) |
+
+The Vite dev server proxies all `/api/deepseek/*` calls server-side, so your API key never reaches the browser.
 
 ---
 
@@ -206,7 +254,7 @@ Open `http://localhost:5173`, select an agent mode, type a prompt, and watch the
 |---|---|
 | Frontend | React 19 + TypeScript |
 | Build | Vite 6 |
-| State | React `useState` (component-local) |
+| State | Zustand (trace history persistence) + React `useState` (component-local) |
 | Icons | Lucide React |
 | Styling | Plain CSS (warm palette, three-column CSS Grid) |
 | API Proxy | Vite dev-server middleware (`/api/deepseek/*`) |
@@ -250,22 +298,82 @@ Hidden reasoning ❌ (outside runtime inspection scope)
 ## Project Structure
 
 ```
-src/
-├── App.tsx       # Main application — components, state, trace builders, inspector panels
-├── types.ts      # TypeScript type definitions (AgentModeId, RuntimeMessage, TraceRun, etc.)
-├── main.tsx      # React entry point
-├── styles.css    # Complete stylesheet
-docs/
-├── version1plan.md   # Original design document (Chinese)
-vite.config.ts    # Vite config + all DeepSeek API proxy middleware
-                  #   /api/deepseek/chat          — Basic LLM
-                  #   /api/deepseek/tool-calling   — Tool Calling
-                  #   /api/deepseek/react          — ReAct loop
-                  #   /api/deepseek/plan-execute   — Plan-and-Execute pipeline
+.
+├── index.html              # HTML entry point
+├── package.json            # Dependencies & scripts
+├── vite.config.ts          # Vite config + all DeepSeek API proxy middleware
+│                           #   /api/deepseek/chat          — Basic LLM
+│                           #   /api/deepseek/tool-calling   — Tool Calling
+│                           #   /api/deepseek/react          — ReAct loop
+│                           #   /api/deepseek/plan-execute   — Plan-and-Execute pipeline
+├── tsconfig.json           # TypeScript config
+├── .env.example            # Environment variable template
+├── src/
+│   ├── main.tsx            # React entry point
+│   ├── App.tsx             # Main application — components, state, trace builders, inspector panels
+│   ├── types.ts            # TypeScript type definitions (AgentModeId, RuntimeMessage, TraceRun, etc.)
+│   ├── styles.css          # Complete stylesheet (three-column layout, warm palette)
+│   └── data/               # Static data / default traces
+└── docs/
+    └── version1plan.md     # Original design document (Chinese)
 ```
+
+---
+
+## MVP Status
+
+All four agent modes are fully implemented with real DeepSeek API calls and annotated trace visualization:
+
+- [x] Three-column UI (Sidebar / Chat / Inspector)
+- [x] **Basic LLM** — real DeepSeek request/response visualization
+- [x] **Tool Calling** — tool schema builder, tool_call parser, tool executor, result append, second model request
+- [x] **ReAct** — Action/Observation loop, multi-turn message growth, max-round limit, final answer synthesis
+- [x] **Plan-and-Execute** — Planner → Executor → Synthesizer pipeline, per-step tool execution, plan-to-context flow
+- [x] Annotated JSON viewers for request, response, memory, and raw trace
+- [x] Multi-turn conversation memory
+- [x] Trace history with replay
+- [x] Vite dev-server proxy (no separate backend needed)
+
+---
+
+## Roadmap
+
+- [ ] **Multi-provider support** — OpenAI, Anthropic, and other compatible APIs
+- [ ] **Streaming visualization** — watch tokens arrive in real time in the trace inspector
+- [ ] **Screenshots & demo video**
+- [ ] **Dark mode**
+- [ ] **Export traces** — download a trace run as JSON for sharing and debugging
+- [ ] **Diff mode** — compare two trace runs side by side
+- [ ] **Custom tool definitions** — let users define and register their own tools from the UI
+
+---
+
+## Contributing
+
+Contributions are welcome! Here's how to get started:
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feat/my-feature`
+3. Make your changes
+4. Run the dev server and verify your changes work: `npm run dev`
+5. Commit using conventional commit messages: `feat: add ...`, `fix: ...`, `docs: ...`
+6. Push and open a Pull Request
+
+For larger changes, please open an issue first to discuss what you'd like to change.
+
+---
+
+## Acknowledgments
+
+AgentXRay is inspired by the need to understand what happens inside agent runtimes. The four agent modes are modeled after well-known patterns in the LLM agent literature:
+
+- **ReAct** — Yao et al., "[ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)" (2022)
+- **Plan-and-Execute** — a practical decomposition pattern widely used in agent frameworks like LangGraph, CrewAI, and AutoGPT
+
+Built with [React](https://react.dev), [Vite](https://vitejs.dev), and [DeepSeek](https://www.deepseek.com).
 
 ---
 
 ## License
 
-MIT
+[MIT](./LICENSE)
