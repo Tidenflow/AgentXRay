@@ -25,6 +25,7 @@
 ## Table of Contents
 
 - [Why AgentXRay](#why-agentxray)
+- [The Boundary AgentXRay Explains](#the-boundary-agentxray-explains)
 - [Supported Agent Modes](#supported-agent-modes)
 - [Try It — Example Prompts](#try-it--example-prompts)
 - [Mode Comparison](#mode-comparison)
@@ -72,7 +73,38 @@ User Prompt
 
 **AgentXRay** turns this black box into an observable message pipeline. Whether you're debugging why your agent hallucinated a tool call, tracing how context accumulates across ReAct rounds, or just curious what a Plan-and-Execute planner actually generates — AgentXRay gives you the X-ray vision to answer:
 
-> *"What exactly did the Agent send to the model — and what did it get back?"*
+> *"How does a model output become a runtime decision and real code execution?"*
+
+## The Boundary AgentXRay Explains
+
+An LLM generates tokens. The JSON visible in an agent application comes from several
+different layers, and treating it all as "the model output" hides the most important part:
+
+| Layer | Responsibility |
+|---|---|
+| Agent runtime | Assembles `messages`, tool schemas, and follow-up requests |
+| LLM | Chooses whether to answer or request a tool, and generates its name and arguments |
+| Model provider | Exposes generated content through its HTTP API and decodes native tool-call output into `message.tool_calls` |
+| Agent runtime | Parses arguments, validates and routes the request, and invokes local code |
+| Tool | Produces an external result; it is never executed by the model |
+
+For example, when a user asks for current weather, a native tool-calling flow is conceptually:
+
+```text
+User: "What is the weather in Shanghai today?"
+  → Runtime exposes get_weather(location)
+  → A tool-trained model emits a tool-call representation
+  → Provider exposes it as tool_calls(name="get_weather", arguments="{...}")
+  → Runtime parses arguments and resolves get_weather in its tool registry
+  → Runtime executes the function
+  → Runtime appends a role=tool result
+  → Model receives that result and writes the final answer
+```
+
+**The model requests; the runtime executes.** AgentXRay can observe the request sent to
+the provider and the structured response returned by it. It cannot observe the provider's
+internal special-token representation or decoding implementation, so that boundary is
+explicitly labeled `provider-managed` rather than presented as model reasoning.
 
 ---
 
@@ -303,19 +335,26 @@ type MessageSource =
 ## How It Works
 
 ```
-┌───────────────┬──────────────────────┬─────────────────────┐
-│   Sidebar     │      Chat Pane       │   Trace Inspector   │
-│               │                      │                     │
-│  Agent Modes  │  User / Assistant    │  Sent to LLM        │
-│  New Trace    │  messages            │  LLM Response       │
-│  History      │  Prompt input        │  Memory             │
-│               │                      │  Raw Trace          │
-└───────────────┴──────────────────────┴─────────────────────┘
+┌────────────────┬────────────────────────┬──────────────────────┐
+│ Experiments    │ Runtime Timeline       │ Step Inspector       │
+│                │                        │                      │
+│ Prompt groups  │ Per-mode result tabs   │ Actor / visibility   │
+│ Mode runs      │ Runtime control flow   │ Transition reason    │
+│ Status/errors  │ Observed steps         │ Input / output       │
+│                │                        │ Raw evidence         │
+└────────────────┴────────────────────────┴──────────────────────┘
+│ Experiment composer: prompt + mode selection + runtime settings │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-- **Chat Pane** — the normal chat experience. Type a prompt, get a reply. Mode-specific rendering shows ReAct rounds and Plan-and-Execute phases inline.
-- **Trace Inspector** — the X-ray. Five annotated JSON views reveal exactly what the runtime constructed, sent, received, and remembered.
-- **Sidebar** — switch between agent modes, start fresh traces, and browse trace history with replay.
+- **Experiment Sidebar** — groups runs by prompt. A single experiment can execute the same prompt sequentially across several selected agent modes; successful runs remain available even if another mode fails.
+- **Runtime Timeline** — the primary view for Basic LLM and Tool Calling. It shows who acted, what happened, and why control moved to the next step instead of presenting another generic chat window.
+- **Step Inspector** — explains the selected step through its actor, observability, transition reason, inputs, outputs, state changes, and raw evidence.
+- **Experiment Composer** — selects one or more agent modes, edits the prompt, and configures shared runtime parameters including temperature and additional system instructions.
+- **Resizable Workspace** — both vertical separators can be dragged to resize the experiment list, timeline, and inspector; double-clicking a separator restores its default width.
+
+ReAct and Plan-and-Execute currently retain their detailed legacy views and will be mapped
+to the same runtime-step language after the Tool Calling and Basic LLM flows are complete.
 
 ### Inspector Tabs
 
@@ -467,8 +506,10 @@ Hidden reasoning ❌ (outside runtime inspection scope)
 ├── src/
 │   ├── main.tsx            # React entry point
 │   ├── App.tsx             # Main application — UI components, state, trace builders, inspector panels (1700+ lines)
+│   ├── runtime/
+│   │   └── traceSteps.ts   # Basic/Tool Calling traces → shared RuntimeStep timeline
 │   ├── types.ts            # TypeScript type definitions (AgentModeId, RuntimeMessage, TraceRun, etc.)
-│   ├── styles.css          # Complete stylesheet (CSS Grid layout, warm palette, color-coded message roles)
+│   ├── styles.css          # Resizable three-pane workbench and runtime visualization styles
 │   └── data/               # Static data / default traces
 └── docs/
     └── version1plan.md     # Original design document (Chinese)
@@ -480,14 +521,16 @@ Hidden reasoning ❌ (outside runtime inspection scope)
 
 All four agent modes are fully implemented with real DeepSeek API calls and annotated trace visualization:
 
-- [x] Three-column UI (Sidebar / Chat / Inspector)
+- [x] Resizable three-pane experiment workbench (Experiments / Runtime Timeline / Step Inspector)
+- [x] Run the same prompt sequentially across multiple selected agent modes
+- [x] Group per-mode results and partial failures under a shared experiment
 - [x] **Basic LLM** — real DeepSeek request/response visualization
-- [x] **Tool Calling** — tool schema builder, tool_call parser, tool executor, result append, second model request
+- [x] **Tool Calling** — provider boundary, tool schema, argument parsing, local execution, result append, second model request
 - [x] **ReAct** — Action/Observation loop, multi-turn message growth, max-round limit, final answer synthesis
 - [x] **Plan-and-Execute** — Planner → Executor → Synthesizer pipeline, per-step tool execution, plan-to-context flow
 - [x] Annotated JSON viewers for request, response, memory, and raw trace
-- [x] Multi-turn conversation memory with cross-turn context persistence
-- [x] Trace history with replay (Zustand-powered persistence)
+- [x] Runtime parameters — temperature and editable additional system instructions
+- [x] In-session experiment history and per-mode result switching
 - [x] Vite dev-server proxy — no separate backend needed
 
 ---

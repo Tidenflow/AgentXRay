@@ -1,4 +1,4 @@
-import { type ReactNode, useMemo, useState } from "react";
+import { type PointerEvent as ReactPointerEvent, type ReactNode, useMemo, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -14,7 +14,8 @@ import {
   Settings2,
   Wrench,
 } from "lucide-react";
-import type { AgentModeId, PlanExecuteStep, ReActStep, RuntimeMessage, ToolExecution, TraceRun } from "./types";
+import type { AgentModeId, PlanExecuteStep, ReActStep, RuntimeMessage, RuntimeStep, ToolExecution, TraceRun } from "./types";
+import { runtimeStepsFromTrace } from "./runtime/traceSteps";
 
 type InspectorTab = "input" | "output" | "tools" | "memory" | "raw";
 
@@ -23,6 +24,14 @@ type AgentModeOption = {
   name: string;
   description: string;
   enabled: boolean;
+};
+
+type Experiment = {
+  id: string;
+  prompt: string;
+  createdAt: number;
+  runs: TraceRun[];
+  errors: Partial<Record<AgentModeId, string>>;
 };
 
 type DeepSeekResult = {
@@ -456,12 +465,23 @@ const buildTraceFromPlanExecute = (
 };
 
 export function App() {
+  const [sidebarWidth, setSidebarWidth] = useState(232);
+  const [workspaceWidth, setWorkspaceWidth] = useState(720);
+  const [activeResize, setActiveResize] = useState<"sidebar" | "workspace" | null>(null);
+  const [temperature, setTemperature] = useState(0.7);
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [showRunSettings, setShowRunSettings] = useState(false);
   const [activeMode, setActiveMode] = useState<AgentModeId>("basic");
   const [prompt, setPrompt] = useState("");
   const [conversationMessages, setConversationMessages] = useState<RuntimeMessage[]>([]);
   const [traces, setTraces] = useState<TraceRun[]>([]);
+  const [experiments, setExperiments] = useState<Experiment[]>([]);
+  const [activeExperimentId, setActiveExperimentId] = useState<string | null>(null);
+  const [selectedModes, setSelectedModes] = useState<AgentModeId[]>(["basic", "tool-calling"]);
+  const [runningMode, setRunningMode] = useState<AgentModeId | null>(null);
   const [activeTraceId, setActiveTraceId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<InspectorTab>("input");
+  const [activeStepId, setActiveStepId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -469,106 +489,161 @@ export function App() {
     () => traces.find((trace) => trace.id === activeTraceId) ?? null,
     [activeTraceId, traces],
   );
+  const runtimeSteps = useMemo(
+    () => (activeTrace ? runtimeStepsFromTrace(activeTrace) : []),
+    [activeTrace],
+  );
+  const activeStep =
+    runtimeSteps.find((step) => step.id === activeStepId) ?? runtimeSteps[0] ?? null;
 
   const selectTrace = (trace: TraceRun) => {
     setActiveTraceId(trace.id);
     setActiveTab("input");
+    setActiveStepId(null);
     setActiveMode(trace.mode);
     setPrompt(trace.userPrompt);
     setConversationMessages(trace.conversationMessages);
+    const experiment = experiments.find((item) => item.runs.some((run) => run.id === trace.id));
+    setActiveExperimentId(experiment?.id ?? null);
+  };
+
+  const executeMode = async (mode: AgentModeId, cleanPrompt: string) => {
+      const turnNumber = 1;
+      const userMessage = toRuntimeMessage(`turn-${turnNumber}-user`, "user", cleanPrompt);
+      const defaultSystemMessage =
+        mode === "tool-calling"
+          ? toolCallingSystemPromptMessage()
+          : mode === "react"
+            ? reactSystemPromptMessage()
+            : mode === "plan-execute"
+              ? planExecuteSystemPromptMessage()
+              : systemPromptMessage();
+      const systemMessage = systemPrompt.trim()
+        ? {
+            ...defaultSystemMessage,
+            content: `${defaultSystemMessage.content}\n\nAdditional system instructions:\n${systemPrompt.trim()}`,
+          }
+        : defaultSystemMessage;
+      const requestMessages = [systemMessage, userMessage];
+      const endpoint =
+        mode === "tool-calling"
+          ? "/api/deepseek/tool-calling"
+          : mode === "react"
+            ? "/api/deepseek/react"
+            : mode === "plan-execute"
+              ? "/api/deepseek/plan-execute"
+              : "/api/deepseek/chat";
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: requestMessages.map(toApiMessage),
+          temperature,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error ?? "DeepSeek request failed.");
+      return mode === "tool-calling"
+        ? buildTraceFromToolCalling(cleanPrompt, payload as ToolCallingResult, turnNumber)
+        : mode === "react"
+          ? buildTraceFromReAct(cleanPrompt, payload as ReActResult, turnNumber)
+          : mode === "plan-execute"
+            ? buildTraceFromPlanExecute(cleanPrompt, payload as PlanExecuteResult, turnNumber)
+            : buildTraceFromDeepSeek(cleanPrompt, payload as DeepSeekResult, turnNumber);
   };
 
   const runTrace = async () => {
     const cleanPrompt = prompt.trim();
-    if (!cleanPrompt || isRunning) return;
+    if (!cleanPrompt || isRunning || selectedModes.length === 0) return;
 
     setIsRunning(true);
     setError(null);
+    const experimentId = `experiment-${Date.now()}`;
+    const experiment: Experiment = { id: experimentId, prompt: cleanPrompt, createdAt: Date.now(), runs: [], errors: {} };
+    setExperiments((current) => [experiment, ...current]);
+    setActiveExperimentId(experimentId);
+    setActiveTraceId(null);
 
-    try {
-      const turnNumber =
-        conversationMessages.filter((message) => message.role === "user").length + 1;
-      const userMessage = toRuntimeMessage(`turn-${turnNumber}-user`, "user", cleanPrompt);
-
-      const systemMessage =
-        activeMode === "tool-calling"
-          ? toolCallingSystemPromptMessage()
-          : activeMode === "react"
-            ? reactSystemPromptMessage()
-            : activeMode === "plan-execute"
-              ? planExecuteSystemPromptMessage()
-              : systemPromptMessage();
-
-      // For ReAct / Plan-Execute, only carry forward user prompts + final assistant answers
-      const contextMessages =
-        activeMode === "react" || activeMode === "plan-execute"
-          ? conversationMessages.filter(
-              (m) =>
-                m.role === "user" ||
-                (m.role === "assistant" && !m.tool_calls?.length && m.content),
-            )
-          : conversationMessages;
-
-      const requestMessages = [systemMessage, ...contextMessages, userMessage];
-
-      const endpoint =
-        activeMode === "tool-calling"
-          ? "/api/deepseek/tool-calling"
-          : activeMode === "react"
-            ? "/api/deepseek/react"
-            : activeMode === "plan-execute"
-              ? "/api/deepseek/plan-execute"
-              : "/api/deepseek/chat";
-
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: requestMessages.map(toApiMessage) }),
-      });
-      const payload = await response.json();
-
-      if (!response.ok) {
-        throw new Error(payload.error ?? "DeepSeek request failed.");
+    for (const mode of selectedModes) {
+      setRunningMode(mode);
+      try {
+        const trace = await executeMode(mode, cleanPrompt);
+        setTraces((current) => [trace, ...current]);
+        setExperiments((current) => current.map((item) => item.id === experimentId ? { ...item, runs: [...item.runs, trace] } : item));
+        setActiveMode(trace.mode);
+        setActiveTraceId(trace.id);
+        setConversationMessages(trace.conversationMessages);
+      } catch (runError) {
+        const message = runError instanceof Error ? runError.message : "未知运行错误。";
+        setExperiments((current) => current.map((item) => item.id === experimentId ? { ...item, errors: { ...item.errors, [mode]: message } } : item));
+        setError(message);
       }
-
-      const trace =
-        activeMode === "tool-calling"
-          ? buildTraceFromToolCalling(cleanPrompt, payload as ToolCallingResult, turnNumber)
-          : activeMode === "react"
-            ? buildTraceFromReAct(cleanPrompt, payload as ReActResult, turnNumber)
-            : activeMode === "plan-execute"
-              ? buildTraceFromPlanExecute(cleanPrompt, payload as PlanExecuteResult, turnNumber)
-              : buildTraceFromDeepSeek(cleanPrompt, payload as DeepSeekResult, turnNumber);
-
-      setTraces((current) => [trace, ...current]);
-      setConversationMessages(trace.conversationMessages);
-      setActiveTraceId(trace.id);
-      setActiveTab("input");
-      setPrompt("");
-    } catch (runError) {
-      setError(runError instanceof Error ? runError.message : "Unknown runtime error.");
-    } finally {
-      setIsRunning(false);
     }
+
+    setRunningMode(null);
+    setIsRunning(false);
+    setActiveTab("input");
+    setActiveStepId(null);
+    setPrompt("");
   };
 
   const selectedMode = modeOptions.find((mode) => mode.id === activeMode) ?? modeOptions[0];
 
+  const startResize = (
+    target: "sidebar" | "workspace",
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startSidebarWidth = sidebarWidth;
+    const startWorkspaceWidth = workspaceWidth;
+    setActiveResize(target);
+
+    const onMove = (moveEvent: PointerEvent) => {
+      const delta = moveEvent.clientX - startX;
+      if (target === "sidebar") {
+        setSidebarWidth(Math.max(180, Math.min(360, startSidebarWidth + delta)));
+        return;
+      }
+
+      const availableWidth = window.innerWidth - sidebarWidth - 4 - 4 - 380;
+      setWorkspaceWidth(Math.max(440, Math.min(availableWidth, startWorkspaceWidth + delta)));
+    };
+
+    const onUp = () => {
+      setActiveResize(null);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
   return (
-    <main className="app-shell">
+    <main
+      className={`app-shell ${activeResize ? "is-resizing" : ""}`}
+      style={{ gridTemplateColumns: `${sidebarWidth}px 4px ${workspaceWidth}px 4px minmax(380px, 1fr)` }}
+    >
       <Sidebar
-        activeMode={activeMode}
         activeTrace={activeTrace}
-        modes={modeOptions}
+        experiments={experiments}
         onNewTrace={() => {
           setActiveTraceId(null);
+          setActiveExperimentId(null);
+          setActiveStepId(null);
           setPrompt("");
           setConversationMessages([]);
           setError(null);
         }}
-        onSelectMode={setActiveMode}
         onSelectTrace={selectTrace}
-        traces={traces}
+      />
+      <div
+        aria-label="调整实验栏宽度"
+        className={`pane-resizer ${activeResize === "sidebar" ? "is-active" : ""}`}
+        onDoubleClick={() => setSidebarWidth(232)}
+        onPointerDown={(event) => startResize("sidebar", event)}
+        role="separator"
       />
       <ChatPane
         error={error}
@@ -579,32 +654,47 @@ export function App() {
         prompt={prompt}
         trace={activeTrace}
         visibleMessages={activeTrace?.conversationMessages ?? conversationMessages}
+        runtimeSteps={runtimeSteps}
+        activeStepId={activeStep?.id ?? null}
+        onSelectStep={setActiveStepId}
+        experiment={experiments.find((item) => item.id === activeExperimentId) ?? null}
+        onSelectTrace={selectTrace}
+        selectedModes={selectedModes}
+        onToggleMode={(mode) => setSelectedModes((current) => current.includes(mode) ? current.filter((item) => item !== mode) : [...current, mode])}
+        runningMode={runningMode}
+        temperature={temperature}
+        onTemperatureChange={setTemperature}
+        systemPrompt={systemPrompt}
+        onSystemPromptChange={setSystemPrompt}
+        showRunSettings={showRunSettings}
+        onToggleRunSettings={() => setShowRunSettings((current) => !current)}
       />
-      <TraceInspector
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        trace={activeTrace}
+      <div
+        aria-label="调整运行时间线宽度"
+        className={`pane-resizer ${activeResize === "workspace" ? "is-active" : ""}`}
+        onDoubleClick={() => setWorkspaceWidth(720)}
+        onPointerDown={(event) => startResize("workspace", event)}
+        role="separator"
       />
+      {selectedMode.id === "basic" || selectedMode.id === "tool-calling" ? (
+        <RuntimeStepInspector step={activeStep} trace={activeTrace} />
+      ) : (
+        <TraceInspector activeTab={activeTab} setActiveTab={setActiveTab} trace={activeTrace} />
+      )}
     </main>
   );
 }
 
 function Sidebar({
-  activeMode,
   activeTrace,
-  modes,
+  experiments,
   onNewTrace,
-  onSelectMode,
   onSelectTrace,
-  traces,
 }: {
-  activeMode: AgentModeId;
   activeTrace: TraceRun | null;
-  modes: AgentModeOption[];
+  experiments: Experiment[];
   onNewTrace: () => void;
-  onSelectMode: (mode: AgentModeId) => void;
   onSelectTrace: (trace: TraceRun) => void;
-  traces: TraceRun[];
 }) {
   return (
     <aside className="sidebar">
@@ -614,50 +704,34 @@ function Sidebar({
         </div>
         <div>
           <h1>AgentXRay</h1>
-          <p>Message Inspector</p>
+          <p>Agent Runtime Explorer</p>
         </div>
       </div>
 
       <button className="new-trace-button" onClick={onNewTrace}>
         <Plus size={16} />
-        New Trace
+        新建实验
       </button>
 
       <section className="nav-section">
-        <div className="section-label">Agent Modes</div>
-        <div className="mode-list">
-          {modes.map((mode) => (
-            <button
-              className={`mode-item ${activeMode === mode.id ? "is-active" : ""}`}
-              disabled={!mode.enabled}
-              key={mode.id}
-              onClick={() => onSelectMode(mode.id)}
-            >
-              <span className="mode-dot" />
-              <span>
-                <strong>{mode.name}</strong>
-                <small>{mode.description}</small>
-              </span>
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section className="nav-section">
-        <div className="section-label">Trace History</div>
+        <div className="section-label">实验记录</div>
         <div className="history-list">
-          {traces.length === 0 ? (
-            <div className="empty-list">No real traces yet.</div>
+          {experiments.length === 0 ? (
+            <div className="empty-list">还没有实验。输入一个问题，并选择要比较的 Agent 模式。</div>
           ) : (
-            traces.map((trace) => (
-              <button
-                className={`history-item ${activeTrace?.id === trace.id ? "is-active" : ""}`}
-                key={`history-${trace.id}`}
-                onClick={() => onSelectTrace(trace)}
-              >
-                <MessageSquareText size={15} />
-                <span>{trace.userPrompt}</span>
-              </button>
+            experiments.map((experiment) => (
+              <article className="experiment-item" key={experiment.id}>
+                <div className="experiment-title"><MessageSquareText size={14} /><span>{experiment.prompt}</span></div>
+                <div className="experiment-runs">
+                  {experiment.runs.map((trace) => (
+                    <button className={activeTrace?.id === trace.id ? "is-active" : ""} key={trace.id} onClick={() => onSelectTrace(trace)}>
+                      <span className="run-status-dot" />{trace.modeName}<small>{trace.durationMs}ms</small>
+                    </button>
+                  ))}
+                  {Object.entries(experiment.errors).map(([mode]) => <div className="experiment-error" key={mode}>! {mode} 运行失败</div>)}
+                  {experiment.runs.length === 0 && Object.keys(experiment.errors).length === 0 ? <div className="experiment-pending">等待运行…</div> : null}
+                </div>
+              </article>
             ))
           )}
         </div>
@@ -675,6 +749,20 @@ function ChatPane({
   prompt,
   trace,
   visibleMessages,
+  runtimeSteps,
+  activeStepId,
+  onSelectStep,
+  experiment,
+  onSelectTrace,
+  selectedModes,
+  onToggleMode,
+  runningMode,
+  temperature,
+  onTemperatureChange,
+  systemPrompt,
+  onSystemPromptChange,
+  showRunSettings,
+  onToggleRunSettings,
 }: {
   error: string | null;
   isRunning: boolean;
@@ -684,6 +772,20 @@ function ChatPane({
   prompt: string;
   trace: TraceRun | null;
   visibleMessages: RuntimeMessage[];
+  runtimeSteps: RuntimeStep[];
+  activeStepId: string | null;
+  onSelectStep: (id: string) => void;
+  experiment: Experiment | null;
+  onSelectTrace: (trace: TraceRun) => void;
+  selectedModes: AgentModeId[];
+  onToggleMode: (mode: AgentModeId) => void;
+  runningMode: AgentModeId | null;
+  temperature: number;
+  onTemperatureChange: (value: number) => void;
+  systemPrompt: string;
+  onSystemPromptChange: (value: string) => void;
+  showRunSettings: boolean;
+  onToggleRunSettings: () => void;
 }) {
   const chatMessages = visibleMessages.filter((message) => {
     if (message.role === "user" || message.role === "tool") return true;
@@ -698,8 +800,8 @@ function ChatPane({
     <section className="chat-pane">
       <header className="chat-header">
         <div>
-          <div className="eyebrow">Current Mode</div>
-          <h2>{mode.name}</h2>
+          <div className="eyebrow">Agent 运行时</div>
+          <h2>{mode.name} 执行过程</h2>
         </div>
         <div className="model-pill">
           <CircleDot size={14} />
@@ -707,8 +809,24 @@ function ChatPane({
         </div>
       </header>
 
+      <nav className="experiment-tabs" aria-label="实验结果">
+          {experiment?.runs.map((run) => (
+            <button className={trace?.id === run.id ? "is-active" : ""} key={run.id} onClick={() => onSelectTrace(run)}>
+              <span className="run-status-dot" />{run.modeName}<small>{run.durationMs}ms</small>
+            </button>
+          ))}
+          {!experiment?.runs.length ? <span className="experiment-tabs-empty">实验结果会显示在这里</span> : null}
+      </nav>
+
       <div className="chat-scroll">
-        {isReActTrace ? (
+        {mode.id === "basic" || mode.id === "tool-calling" ? (
+          <RuntimeTimeline
+            activeStepId={activeStepId}
+            mode={mode.id}
+            onSelectStep={onSelectStep}
+            steps={runtimeSteps}
+          />
+        ) : isReActTrace ? (
           <ReActChatView
             result={trace!.requestPayload as ReActResult}
             userPrompt={trace!.userPrompt}
@@ -766,23 +884,53 @@ function ChatPane({
 
       <footer className="composer">
         <div className="composer-toolbar">
-          <span>
-            {mode.enabled
-              ? trace
-                ? "next run will include this conversation"
-                : "real DeepSeek request"
-              : "mode not wired yet"}
-          </span>
-          <button aria-label="Settings">
+          <span className="run-config-summary">Temperature {temperature.toFixed(1)}</span>
+          <button aria-expanded={showRunSettings} aria-label="运行参数" className={showRunSettings ? "is-active" : ""} onClick={onToggleRunSettings}>
             <Settings2 size={15} />
           </button>
         </div>
+        {showRunSettings ? (
+          <section className="run-settings-panel">
+            <label className="temperature-control">
+              <span><strong>Temperature</strong><small>输出随机性</small></span>
+              <input
+                max="2"
+                min="0"
+                onChange={(event) => onTemperatureChange(Number(event.target.value))}
+                step="0.1"
+                type="range"
+                value={temperature}
+              />
+              <output>{temperature.toFixed(1)}</output>
+            </label>
+            <label className="system-prompt-control">
+              <span><strong>System Prompt</strong><small>与各模式的运行协议合并</small></span>
+              <textarea
+                onChange={(event) => onSystemPromptChange(event.target.value)}
+                placeholder="输入系统提示词；留空时使用模式默认值"
+                spellCheck={false}
+                value={systemPrompt}
+              />
+            </label>
+          </section>
+        ) : null}
         {error ? (
           <div className="error-banner">
             <AlertCircle size={15} />
             {error}
           </div>
         ) : null}
+        <div className="mode-selector" aria-label="选择运行模式">
+          {modeOptions.map((option) => {
+            const selected = selectedModes.includes(option.id);
+            const running = runningMode === option.id;
+            return (
+              <button className={selected ? "is-selected" : ""} disabled={isRunning} key={option.id} onClick={() => onToggleMode(option.id)}>
+                <span>{running ? "◌" : selected ? "✓" : "+"}</span>{option.name}
+              </button>
+            );
+          })}
+        </div>
         <div className="input-row">
           <textarea
             aria-label="Prompt"
@@ -795,13 +943,147 @@ function ChatPane({
           <button
             className="run-button"
             aria-label="Run trace"
-            disabled={isRunning || !prompt.trim() || !mode.enabled}
+            disabled={isRunning || !prompt.trim() || selectedModes.length === 0}
             onClick={onRun}
           >
-            <Play size={16} />
+            {isRunning ? <span className="run-progress">{selectedModes.findIndex((item) => item === runningMode) + 1}/{selectedModes.length}</span> : <Play size={16} />}
           </button>
         </div>
       </footer>
+    </section>
+  );
+}
+
+function RuntimeTimeline({
+  activeStepId,
+  mode,
+  onSelectStep,
+  steps,
+}: {
+  activeStepId: string | null;
+  mode: AgentModeId;
+  onSelectStep: (id: string) => void;
+  steps: RuntimeStep[];
+}) {
+  const preview = mode === "tool-calling"
+    ? ["声明可用工具", "模型选择下一步", "模型服务解析", "参数解析与路由", "执行工具", "回填工具结果", "生成最终回答"]
+    : ["接收用户目标", "组装模型请求", "模型生成 Token", "模型服务包装响应", "提取最终回答"];
+
+  return (
+    <div className="runtime-timeline">
+      <div className="runtime-intro">
+        <span>{steps.length ? "真实运行时间线" : "执行流程预览"}</span>
+        <h3>{steps.length ? "这次运行内部发生了什么" : "运行后，Agent 内部会发生什么"}</h3>
+        <p>{steps.length
+          ? "沿着时间线观察模型输出如何变成 Runtime 行动。选择任意步骤查看依据。"
+          : "这里不以对话为中心，而是展示谁执行了操作、状态发生了什么变化，以及为什么进入下一步。"}</p>
+      </div>
+      {steps.length === 0 ? (
+        <div className="runtime-preview">
+          {preview.map((title, index) => (
+            <div className="runtime-preview-step" key={title}>
+              <span>{String(index + 1).padStart(2, "0")}</span>
+              <strong>{title}</strong>
+            </div>
+          ))}
+          <div className="runtime-preview-note">
+            <Wrench size={16} />
+            <span>{mode === "tool-calling"
+              ? "可以尝试：现在上海几点？请使用时间工具。"
+              : "可以尝试：解释一下天空为什么是蓝色的。"}</span>
+          </div>
+        </div>
+      ) : steps.map((runtimeStep, index) => (
+        <button
+          className={`runtime-step-card ${activeStepId === runtimeStep.id ? "is-active" : ""}`}
+          key={runtimeStep.id}
+          onClick={() => onSelectStep(runtimeStep.id)}
+        >
+          <span className="runtime-step-index">{String(index + 1).padStart(2, "0")}</span>
+          <span className={`runtime-step-dot actor-${runtimeStep.actor}`} />
+          <span className="runtime-step-copy">
+            <span className="runtime-step-meta">
+              {actorLabel(runtimeStep.actor)} · {visibilityLabel(runtimeStep.visibility)}
+            </span>
+            <strong>{runtimeStep.title}</strong>
+            <small>{runtimeStep.summary}</small>
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function RuntimeStepInspector({ step, trace }: { step: RuntimeStep | null; trace: TraceRun | null }) {
+  return (
+    <aside className="inspector runtime-step-inspector">
+      <header className="inspector-header">
+        <div>
+          <div className="eyebrow">运行步骤</div>
+          <h2>{step?.title ?? "选择一个步骤"}</h2>
+        </div>
+        <span className="model-pill"><CircleDot size={14} />{trace?.model ?? "DeepSeek"}</span>
+      </header>
+      {step ? (
+        <div className="step-detail-scroll">
+          <section className="step-explanation">
+            <div className="step-badges">
+              <span>{actorLabel(step.actor)}</span><span>{visibilityLabel(step.visibility)}</span>
+            </div>
+            <p>{step.summary}</p>
+          </section>
+          <section className="why-card">
+            <div className="section-label">为什么进入下一步</div>
+            <p>{step.transitionReason}</p>
+          </section>
+          <ArtifactSection title="输入" artifacts={step.input} />
+          <ArtifactSection title="输出" artifacts={step.output} />
+          <ArtifactSection title="状态变化" artifacts={step.stateChange} />
+          <ArtifactSection title="原始依据" artifacts={step.raw} />
+        </div>
+      ) : (
+        <div className="inspector-empty-runtime">
+          <div className="empty-runtime-mark"><Activity size={22} /></div>
+          <h3>选择一个运行步骤</h3>
+          <p>运行后，这里会解释每项数据由谁产生、为什么发生下一步，以及哪些信息可以直接观察。</p>
+          <div className="visibility-legend">
+            <span><i className="observed-dot" />直接观察</span>
+            <span><i className="inferred-dot" />合理推断</span>
+            <span><i className="provider-dot" />模型服务内部处理</span>
+          </div>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+const actorLabel = (actor: RuntimeStep["actor"]) => ({
+  user: "用户",
+  runtime: "Agent Runtime",
+  model: "模型",
+  provider: "模型服务",
+  tool: "工具",
+})[actor];
+
+const visibilityLabel = (visibility: RuntimeStep["visibility"]) => ({
+  observed: "直接观察",
+  inferred: "合理推断",
+  "provider-managed": "服务内部处理",
+})[visibility];
+
+function ArtifactSection({ title, artifacts }: { title: string; artifacts?: RuntimeStep["input"] }) {
+  if (!artifacts?.length) return null;
+  return (
+    <section className="artifact-section">
+      <div className="section-label">{title}</div>
+      {artifacts.map((artifact, index) => (
+        <div className="artifact" key={`${artifact.label}-${index}`}>
+          <strong>{artifact.label}</strong>
+          {artifact.format === "text" ? <p>{String(artifact.value ?? "")}</p> : (
+            <pre>{artifact.format === "code" ? String(artifact.value ?? "") : JSON.stringify(artifact.value, null, 2)}</pre>
+          )}
+        </div>
+      ))}
     </section>
   );
 }
