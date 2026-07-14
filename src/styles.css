@@ -597,6 +597,89 @@ textarea:disabled {
   font-size: 12px;
 }
 
+.run-config-summary {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+}
+
+.composer-toolbar button.is-active {
+  background: var(--panel-soft);
+  color: var(--text);
+}
+
+.run-settings-panel {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.7fr) minmax(320px, 1.3fr);
+  gap: 18px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: #fafaf8;
+}
+
+.temperature-control,
+.system-prompt-control {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.temperature-control > span,
+.system-prompt-control > span {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.temperature-control strong,
+.system-prompt-control strong {
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.temperature-control small,
+.system-prompt-control small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.temperature-control {
+  display: grid;
+  grid-template-columns: 1fr 34px;
+  align-content: start;
+}
+
+.temperature-control > span {
+  grid-column: 1 / -1;
+}
+
+.temperature-control input[type="range"] {
+  width: 100%;
+  margin: 5px 0 0;
+  accent-color: var(--green);
+}
+
+.temperature-control output {
+  align-self: center;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  text-align: right;
+}
+
+.system-prompt-control textarea {
+  min-height: 58px;
+  padding: 8px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  background: #fff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
 .mode-selector {
   display: flex;
   flex-wrap: wrap;

@@ -468,6 +468,9 @@ export function App() {
   const [sidebarWidth, setSidebarWidth] = useState(232);
   const [workspaceWidth, setWorkspaceWidth] = useState(720);
   const [activeResize, setActiveResize] = useState<"sidebar" | "workspace" | null>(null);
+  const [temperature, setTemperature] = useState(0.7);
+  const [systemPrompt, setSystemPrompt] = useState("");
+  const [showRunSettings, setShowRunSettings] = useState(false);
   const [activeMode, setActiveMode] = useState<AgentModeId>("basic");
   const [prompt, setPrompt] = useState("");
   const [conversationMessages, setConversationMessages] = useState<RuntimeMessage[]>([]);
@@ -507,7 +510,7 @@ export function App() {
   const executeMode = async (mode: AgentModeId, cleanPrompt: string) => {
       const turnNumber = 1;
       const userMessage = toRuntimeMessage(`turn-${turnNumber}-user`, "user", cleanPrompt);
-      const systemMessage =
+      const defaultSystemMessage =
         mode === "tool-calling"
           ? toolCallingSystemPromptMessage()
           : mode === "react"
@@ -515,6 +518,12 @@ export function App() {
             : mode === "plan-execute"
               ? planExecuteSystemPromptMessage()
               : systemPromptMessage();
+      const systemMessage = systemPrompt.trim()
+        ? {
+            ...defaultSystemMessage,
+            content: `${defaultSystemMessage.content}\n\nAdditional system instructions:\n${systemPrompt.trim()}`,
+          }
+        : defaultSystemMessage;
       const requestMessages = [systemMessage, userMessage];
       const endpoint =
         mode === "tool-calling"
@@ -527,7 +536,10 @@ export function App() {
       const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: requestMessages.map(toApiMessage) }),
+        body: JSON.stringify({
+          messages: requestMessages.map(toApiMessage),
+          temperature,
+        }),
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error ?? "DeepSeek request failed.");
@@ -650,6 +662,12 @@ export function App() {
         selectedModes={selectedModes}
         onToggleMode={(mode) => setSelectedModes((current) => current.includes(mode) ? current.filter((item) => item !== mode) : [...current, mode])}
         runningMode={runningMode}
+        temperature={temperature}
+        onTemperatureChange={setTemperature}
+        systemPrompt={systemPrompt}
+        onSystemPromptChange={setSystemPrompt}
+        showRunSettings={showRunSettings}
+        onToggleRunSettings={() => setShowRunSettings((current) => !current)}
       />
       <div
         aria-label="调整运行时间线宽度"
@@ -739,6 +757,12 @@ function ChatPane({
   selectedModes,
   onToggleMode,
   runningMode,
+  temperature,
+  onTemperatureChange,
+  systemPrompt,
+  onSystemPromptChange,
+  showRunSettings,
+  onToggleRunSettings,
 }: {
   error: string | null;
   isRunning: boolean;
@@ -756,6 +780,12 @@ function ChatPane({
   selectedModes: AgentModeId[];
   onToggleMode: (mode: AgentModeId) => void;
   runningMode: AgentModeId | null;
+  temperature: number;
+  onTemperatureChange: (value: number) => void;
+  systemPrompt: string;
+  onSystemPromptChange: (value: string) => void;
+  showRunSettings: boolean;
+  onToggleRunSettings: () => void;
 }) {
   const chatMessages = visibleMessages.filter((message) => {
     if (message.role === "user" || message.role === "tool") return true;
@@ -854,11 +884,36 @@ function ChatPane({
 
       <footer className="composer">
         <div className="composer-toolbar">
-          <span>新建运行实验 · 同一个问题，对比不同 Agent 模式</span>
-          <button aria-label="Settings">
+          <span className="run-config-summary">Temperature {temperature.toFixed(1)}</span>
+          <button aria-expanded={showRunSettings} aria-label="运行参数" className={showRunSettings ? "is-active" : ""} onClick={onToggleRunSettings}>
             <Settings2 size={15} />
           </button>
         </div>
+        {showRunSettings ? (
+          <section className="run-settings-panel">
+            <label className="temperature-control">
+              <span><strong>Temperature</strong><small>输出随机性</small></span>
+              <input
+                max="2"
+                min="0"
+                onChange={(event) => onTemperatureChange(Number(event.target.value))}
+                step="0.1"
+                type="range"
+                value={temperature}
+              />
+              <output>{temperature.toFixed(1)}</output>
+            </label>
+            <label className="system-prompt-control">
+              <span><strong>System Prompt</strong><small>与各模式的运行协议合并</small></span>
+              <textarea
+                onChange={(event) => onSystemPromptChange(event.target.value)}
+                placeholder="输入系统提示词；留空时使用模式默认值"
+                spellCheck={false}
+                value={systemPrompt}
+              />
+            </label>
+          </section>
+        ) : null}
         {error ? (
           <div className="error-banner">
             <AlertCircle size={15} />
