@@ -63,6 +63,7 @@ export type RuntimeArtifact = {
 
 export type RuntimeStep = {
   id: string;
+  group?: string;
   kind: RuntimeStepKind;
   title: string;
   summary: string;
