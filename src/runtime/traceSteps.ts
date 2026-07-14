@@ -26,9 +26,37 @@ type ToolTraceOutput = {
   followUpResponsePayload?: ApiPayload | null;
 };
 
+type ReActTraceStep = {
+  round: number;
+  assistantContent: string;
+  parsed: {
+    thought?: string;
+    action?: string;
+    actionInput?: unknown;
+    finalAnswer?: string;
+    parseError?: string;
+  };
+  toolExecution?: ToolExecution;
+  observationMessage?: { role: 'user'; content: string };
+  requestPayload: unknown;
+  responsePayload: unknown;
+};
+
+type ReActTraceData = {
+  requestPayload?: ApiPayload | null;
+  responsePayload?: ApiPayload | null;
+  reactToolGuide?: string;
+  reactSteps?: ReActTraceStep[];
+  finalRequestPayload?: ApiPayload | null;
+  finalResponsePayload?: ApiPayload | null;
+  finalAnswer?: string;
+  maxRounds?: number;
+};
+
 const step = (value: RuntimeStep) => value;
 
 export function runtimeStepsFromTrace(trace: TraceRun): RuntimeStep[] {
+  if (trace.mode === 'react') return reactRuntimeSteps(trace);
   if (trace.mode === "tool-calling") return toolCallingSteps(trace);
   if (trace.mode === "basic") return basicSteps(trace);
   return legacySteps(trace);
@@ -124,6 +152,127 @@ function toolCallingSteps(trace: TraceRun): RuntimeStep[] {
   }
 
   steps.push(step({ id: "final", kind: "output", title: "展示最终回答", summary: trace.finalAnswer || "没有返回最终文本。", actor: "runtime", visibility: "observed", transitionReason: "本次运行已经完成。", output: [{ label: "展示给用户的回答", value: trace.finalAnswer, format: "text" }] }));
+  return steps;
+}
+
+function reactRuntimeSteps(trace: TraceRun): RuntimeStep[] {
+  const data = trace.requestPayload as ReActTraceData;
+  const rounds = data.reactSteps ?? [];
+  const initialRequest = data.requestPayload ?? (rounds[0]?.requestPayload as ApiPayload | undefined) ?? {};
+  const steps: RuntimeStep[] = [
+    step({ id: 'goal', group: '准备阶段', kind: 'input', title: '接收用户目标', summary: trace.userPrompt, actor: 'user', visibility: 'observed', transitionReason: 'Runtime 根据用户目标启动 ReAct 循环。', output: [{ label: '用户文本', value: trace.userPrompt, format: 'text' }] }),
+    step({
+      id: 'react-assemble',
+      group: '准备阶段',
+      kind: 'context',
+      title: '组装 ReAct 初始请求',
+      summary: `Runtime 注入 ReAct 文本协议，并设置最多 ${data.maxRounds ?? rounds.length} 轮执行。`,
+      actor: 'runtime',
+      visibility: 'observed',
+      transitionReason: '模型需要明确的 Thought / Action / Action Input / Final Answer 协议和可用工具说明。',
+      input: [
+        { label: '初始消息', value: initialRequest.messages ?? [], format: 'json' },
+        { label: 'ReAct 工具说明', value: data.reactToolGuide ?? '', format: 'text' },
+      ],
+      output: [{ label: '第一轮请求体', value: initialRequest, format: 'json' }],
+    }),
+  ];
+
+  rounds.forEach((round, index) => {
+    const group = `Round ${round.round}`;
+    const request = round.requestPayload as ApiPayload;
+    const response = round.responsePayload as ApiPayload;
+    const providerMessage = response?.choices?.[0]?.message;
+    const parsed = round.parsed ?? {};
+
+    steps.push(step({
+      id: `react-round-${round.round}-model`, group, kind: 'model', title: `Round ${round.round}：模型生成下一步`,
+      summary: parsed.finalAnswer ? '模型输出 Final Answer，准备结束循环。' : parsed.action ? `模型输出 Action ${parsed.action}。` : '模型返回了一段需要 Runtime 解析的 ReAct 文本。',
+      actor: 'model', visibility: 'inferred', transitionReason: '生成结果通过模型服务的 Chat Completion 响应返回给 Runtime。',
+      input: [{ label: '本轮模型消息', value: request?.messages ?? [], format: 'json' }],
+      output: [{ label: '显式 Assistant 文本', value: round.assistantContent ?? '', format: 'text' }],
+    }));
+
+    steps.push(step({
+      id: `react-round-${round.round}-provider`, group, kind: 'provider', title: `Round ${round.round}：模型服务包装响应`,
+      summary: 'DeepSeek 将模型生成的 ReAct 文本放入 Assistant message.content。', actor: 'provider', visibility: 'observed',
+      transitionReason: 'Runtime 接下来解析可观察的 Assistant 文本，决定执行工具还是结束循环。',
+      input: [{ label: 'Assistant 消息', value: providerMessage ?? null, format: 'json' }],
+      output: [{ label: '本轮 API 响应', value: response ?? null, format: 'json' }],
+      raw: [{ label: '本轮请求体', value: request ?? null, format: 'json' }],
+    }));
+
+    steps.push(step({
+      id: `react-round-${round.round}-parse`, group, kind: 'parse', title: `Round ${round.round}：解析 ReAct 协议`,
+      summary: parsed.finalAnswer ? 'Runtime 识别到 Final Answer。' : parsed.action ? `Runtime 识别到 ${parsed.action} 及其输入参数。` : parsed.parseError ?? 'Runtime 未识别到有效的 Action 或 Final Answer。',
+      actor: 'runtime', visibility: 'observed',
+      transitionReason: parsed.finalAnswer ? 'Runtime 识别到 Final Answer，结束 ReAct 循环。' : parsed.action ? `Runtime 识别到 Action ${parsed.action}，进入工具路由与执行。` : 'Runtime 将解析失败作为 Observation 反馈给下一轮。',
+      input: [{ label: '显式 Assistant 文本', value: round.assistantContent ?? '', format: 'text' }],
+      output: [
+        { label: '解析结果', value: parsed, format: 'json' },
+        { label: '可观察边界', value: 'Thought 是模型服务返回的显式文本，不代表模型未公开的隐藏思维过程。', format: 'text' },
+      ],
+    }));
+
+    if (round.toolExecution) {
+      steps.push(step({
+        id: `react-round-${round.round}-tool`, group, kind: 'tool', title: `Round ${round.round}：执行 ${round.toolExecution.name}`,
+        summary: round.toolExecution.ok ? 'Runtime 调用本地工具并获得可观察结果；模型本身不会执行工具。' : round.toolExecution.error ?? '工具执行失败。',
+        actor: 'tool', visibility: 'observed', transitionReason: 'Runtime 将工具结果包装为 Observation，并追加到下一轮上下文。',
+        input: [
+          { label: '工具名称', value: round.toolExecution.name, format: 'text' },
+          { label: '解析后的参数', value: round.toolExecution.arguments, format: 'json' },
+        ],
+        output: [
+          { label: '执行结果', value: round.toolExecution.content, format: 'text' },
+          { label: '执行状态', value: { ok: round.toolExecution.ok, error: round.toolExecution.error }, format: 'json' },
+        ],
+      }));
+    }
+
+    if (round.observationMessage) {
+      const nextRequest = (rounds[index + 1]?.requestPayload ?? data.finalRequestPayload) as ApiPayload | null | undefined;
+      steps.push(step({
+        id: `react-round-${round.round}-observation`, group, kind: 'observation', title: `Round ${round.round}：追加 Observation`,
+        summary: 'Runtime 把 Assistant 行动文本和 Observation 追加到消息历史。', actor: 'runtime', visibility: 'observed',
+        transitionReason: nextRequest ? '更新后的消息栈将作为下一次模型请求的上下文。' : 'Observation 已记录，Runtime 准备进入下一轮。',
+        input: [{ label: 'Observation 消息', value: round.observationMessage, format: 'json' }],
+        stateChange: [{ label: '更新后的消息列表', value: nextRequest?.messages ?? [], format: 'json' }],
+        raw: nextRequest ? [{ label: '下一次请求体', value: nextRequest, format: 'json' }] : undefined,
+      }));
+    }
+  });
+
+  if (data.finalRequestPayload) {
+    const fallbackMessage = data.finalResponsePayload?.choices?.[0]?.message;
+    steps.push(step({
+      id: 'react-round-limit', group: '轮次上限', kind: 'decision', title: '达到最大 ReAct 轮数',
+      summary: `循环在 ${data.maxRounds ?? rounds.length} 轮后仍未得到 Final Answer。`, actor: 'runtime', visibility: 'observed',
+      transitionReason: 'Runtime 停止继续调用工具，改为要求模型基于已有 Observation 生成最终回答。',
+      output: [{ label: '最终回答请求体', value: data.finalRequestPayload, format: 'json' }],
+    }));
+    steps.push(step({
+      id: 'react-fallback-model', group: '轮次上限', kind: 'model', title: '根据已有 Observation 生成回答',
+      summary: '模型基于累积消息生成一次尽力而为的最终回答。', actor: 'model', visibility: 'inferred',
+      transitionReason: '模型服务将最终内容包装为 Chat Completion 响应。',
+      input: [{ label: '最终上下文', value: data.finalRequestPayload.messages ?? [], format: 'json' }],
+      output: [{ label: '生成的 Assistant 内容', value: fallbackMessage?.content ?? '', format: 'text' }],
+    }));
+    steps.push(step({
+      id: 'react-fallback-provider', group: '轮次上限', kind: 'provider', title: '模型服务返回最终响应',
+      summary: 'DeepSeek 返回最大轮数后的最终合成结果。', actor: 'provider', visibility: 'observed',
+      transitionReason: 'Runtime 从响应中提取最终回答并结束本次运行。',
+      output: [{ label: '最终 API 响应', value: data.finalResponsePayload ?? null, format: 'json' }],
+    }));
+  }
+
+  steps.push(step({
+    id: 'final', group: '完成', kind: 'output', title: '展示最终回答', summary: trace.finalAnswer || '没有返回最终文本。',
+    actor: 'runtime', visibility: 'observed',
+    transitionReason: data.finalRequestPayload ? '最大轮数后的最终合成已完成，本次运行结束。' : 'Runtime 已识别到 Final Answer，本次 ReAct 循环结束。',
+    output: [{ label: '展示给用户的回答', value: trace.finalAnswer, format: 'text' }],
+  }));
+
   return steps;
 }
 

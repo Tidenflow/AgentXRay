@@ -1890,3 +1890,24 @@ textarea {
 
   .chat-scroll { padding-inline: 24px; }
 }
+
+.runtime-step-entry:not(:last-child) .runtime-step-card::after {
+  display: block;
+}
+
+.runtime-step-entry:last-child .runtime-step-card::after {
+  display: none;
+}
+
+.runtime-step-group {
+  margin: 18px 0 8px 48px;
+  color: var(--green);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.runtime-step-entry:first-child .runtime-step-group {
+  margin-top: 0;
+}
