@@ -47,7 +47,38 @@ User Prompt
 
 AgentXRay visualizes every one of these hidden steps so you can answer:
 
-> *"What exactly did the Agent send to the model — and what did it get back?"*
+> *"How does a model output become a runtime decision and real code execution?"*
+
+## The Boundary AgentXRay Explains
+
+An LLM generates tokens. The JSON visible in an agent application comes from several
+different layers, and treating it all as "the model output" hides the most important part:
+
+| Layer | Responsibility |
+|---|---|
+| Agent runtime | Assembles `messages`, tool schemas, and follow-up requests |
+| LLM | Chooses whether to answer or request a tool, and generates its name and arguments |
+| Model provider | Exposes generated content through its HTTP API and decodes native tool-call output into `message.tool_calls` |
+| Agent runtime | Parses arguments, validates and routes the request, and invokes local code |
+| Tool | Produces an external result; it is never executed by the model |
+
+For example, when a user asks for current weather, a native tool-calling flow is conceptually:
+
+```text
+User: "What is the weather in Shanghai today?"
+  → Runtime exposes get_weather(location)
+  → A tool-trained model emits a tool-call representation
+  → Provider exposes it as tool_calls(name="get_weather", arguments="{...}")
+  → Runtime parses arguments and resolves get_weather in its tool registry
+  → Runtime executes the function
+  → Runtime appends a role=tool result
+  → Model receives that result and writes the final answer
+```
+
+**The model requests; the runtime executes.** AgentXRay can observe the request sent to
+the provider and the structured response returned by it. It cannot observe the provider's
+internal special-token representation or decoding implementation, so that boundary is
+explicitly labeled `provider-managed` rather than presented as model reasoning.
 
 ---
 
@@ -124,18 +155,21 @@ User Prompt
 
 ```
 ┌───────────────┬──────────────────────┬─────────────────────┐
-│   Sidebar     │      Chat Pane       │   Trace Inspector   │
+│   Sidebar     │   Runtime Timeline   │   Step Inspector    │
 │               │                      │                     │
-│  Agent Modes  │  User / Assistant    │  Sent to LLM        │
-│  New Trace    │  messages            │  LLM Response       │
-│  History      │  Prompt input        │  Memory             │
-│               │                      │  Raw Trace          │
+│  Agent Modes  │  Runtime steps       │  Actor / visibility │
+│  New Trace    │  Control flow        │  Why it happened    │
+│  History      │  Prompt input        │  Input / output     │
+│               │                      │  Raw evidence       │
 └───────────────┴──────────────────────┴─────────────────────┘
 ```
 
-- **Chat Pane** — the normal chat experience. Type a prompt, get a reply. Mode-specific rendering shows ReAct rounds and Plan-and-Execute phases inline.
-- **Trace Inspector** — the X-ray. Four annotated JSON views reveal exactly what the runtime constructed, sent, received, and remembered.
+- **Runtime Timeline** — the primary view for Basic LLM and Tool Calling. It shows who acted, what happened, and where control moved next instead of presenting another chat window.
+- **Step Inspector** — explains the selected step through its actor, observability, transition reason, inputs, outputs, state changes, and raw evidence.
 - **Sidebar** — switch between agent modes, start fresh traces, and browse trace history with replay.
+
+ReAct and Plan-and-Execute currently retain their detailed legacy views and will be mapped
+to the same runtime-step language after the Tool Calling and Basic LLM flows are complete.
 
 ### Inspector Tabs
 

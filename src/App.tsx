@@ -14,7 +14,8 @@ import {
   Settings2,
   Wrench,
 } from "lucide-react";
-import type { AgentModeId, PlanExecuteStep, ReActStep, RuntimeMessage, ToolExecution, TraceRun } from "./types";
+import type { AgentModeId, PlanExecuteStep, ReActStep, RuntimeMessage, RuntimeStep, ToolExecution, TraceRun } from "./types";
+import { runtimeStepsFromTrace } from "./runtime/traceSteps";
 
 type InspectorTab = "input" | "output" | "tools" | "memory" | "raw";
 
@@ -462,6 +463,7 @@ export function App() {
   const [traces, setTraces] = useState<TraceRun[]>([]);
   const [activeTraceId, setActiveTraceId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<InspectorTab>("input");
+  const [activeStepId, setActiveStepId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -469,10 +471,17 @@ export function App() {
     () => traces.find((trace) => trace.id === activeTraceId) ?? null,
     [activeTraceId, traces],
   );
+  const runtimeSteps = useMemo(
+    () => (activeTrace ? runtimeStepsFromTrace(activeTrace) : []),
+    [activeTrace],
+  );
+  const activeStep =
+    runtimeSteps.find((step) => step.id === activeStepId) ?? runtimeSteps[0] ?? null;
 
   const selectTrace = (trace: TraceRun) => {
     setActiveTraceId(trace.id);
     setActiveTab("input");
+    setActiveStepId(null);
     setActiveMode(trace.mode);
     setPrompt(trace.userPrompt);
     setConversationMessages(trace.conversationMessages);
@@ -544,6 +553,7 @@ export function App() {
       setConversationMessages(trace.conversationMessages);
       setActiveTraceId(trace.id);
       setActiveTab("input");
+      setActiveStepId(null);
       setPrompt("");
     } catch (runError) {
       setError(runError instanceof Error ? runError.message : "Unknown runtime error.");
@@ -579,12 +589,15 @@ export function App() {
         prompt={prompt}
         trace={activeTrace}
         visibleMessages={activeTrace?.conversationMessages ?? conversationMessages}
+        runtimeSteps={runtimeSteps}
+        activeStepId={activeStep?.id ?? null}
+        onSelectStep={setActiveStepId}
       />
-      <TraceInspector
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        trace={activeTrace}
-      />
+      {selectedMode.id === "basic" || selectedMode.id === "tool-calling" ? (
+        <RuntimeStepInspector step={activeStep} trace={activeTrace} />
+      ) : (
+        <TraceInspector activeTab={activeTab} setActiveTab={setActiveTab} trace={activeTrace} />
+      )}
     </main>
   );
 }
@@ -614,7 +627,7 @@ function Sidebar({
         </div>
         <div>
           <h1>AgentXRay</h1>
-          <p>Message Inspector</p>
+          <p>Agent Runtime Explorer</p>
         </div>
       </div>
 
@@ -644,7 +657,7 @@ function Sidebar({
       </section>
 
       <section className="nav-section">
-        <div className="section-label">Trace History</div>
+        <div className="section-label">Runtime Runs</div>
         <div className="history-list">
           {traces.length === 0 ? (
             <div className="empty-list">No real traces yet.</div>
@@ -675,6 +688,9 @@ function ChatPane({
   prompt,
   trace,
   visibleMessages,
+  runtimeSteps,
+  activeStepId,
+  onSelectStep,
 }: {
   error: string | null;
   isRunning: boolean;
@@ -684,6 +700,9 @@ function ChatPane({
   prompt: string;
   trace: TraceRun | null;
   visibleMessages: RuntimeMessage[];
+  runtimeSteps: RuntimeStep[];
+  activeStepId: string | null;
+  onSelectStep: (id: string) => void;
 }) {
   const chatMessages = visibleMessages.filter((message) => {
     if (message.role === "user" || message.role === "tool") return true;
@@ -698,8 +717,8 @@ function ChatPane({
     <section className="chat-pane">
       <header className="chat-header">
         <div>
-          <div className="eyebrow">Current Mode</div>
-          <h2>{mode.name}</h2>
+          <div className="eyebrow">Agent 运行时</div>
+          <h2>{mode.name} 执行过程</h2>
         </div>
         <div className="model-pill">
           <CircleDot size={14} />
@@ -708,7 +727,14 @@ function ChatPane({
       </header>
 
       <div className="chat-scroll">
-        {isReActTrace ? (
+        {mode.id === "basic" || mode.id === "tool-calling" ? (
+          <RuntimeTimeline
+            activeStepId={activeStepId}
+            mode={mode.id}
+            onSelectStep={onSelectStep}
+            steps={runtimeSteps}
+          />
+        ) : isReActTrace ? (
           <ReActChatView
             result={trace!.requestPayload as ReActResult}
             userPrompt={trace!.userPrompt}
@@ -769,8 +795,8 @@ function ChatPane({
           <span>
             {mode.enabled
               ? trace
-                ? "next run will include this conversation"
-                : "real DeepSeek request"
+                ? "continue with the current runtime context"
+                : "describe a goal, then inspect every runtime step"
               : "mode not wired yet"}
           </span>
           <button aria-label="Settings">
@@ -802,6 +828,140 @@ function ChatPane({
           </button>
         </div>
       </footer>
+    </section>
+  );
+}
+
+function RuntimeTimeline({
+  activeStepId,
+  mode,
+  onSelectStep,
+  steps,
+}: {
+  activeStepId: string | null;
+  mode: AgentModeId;
+  onSelectStep: (id: string) => void;
+  steps: RuntimeStep[];
+}) {
+  const preview = mode === "tool-calling"
+    ? ["声明可用工具", "模型选择下一步", "模型服务解析", "参数解析与路由", "执行工具", "回填工具结果", "生成最终回答"]
+    : ["接收用户目标", "组装模型请求", "模型生成 Token", "模型服务包装响应", "提取最终回答"];
+
+  return (
+    <div className="runtime-timeline">
+      <div className="runtime-intro">
+        <span>{steps.length ? "真实运行时间线" : "执行流程预览"}</span>
+        <h3>{steps.length ? "这次运行内部发生了什么" : "运行后，Agent 内部会发生什么"}</h3>
+        <p>{steps.length
+          ? "沿着时间线观察模型输出如何变成 Runtime 行动。选择任意步骤查看依据。"
+          : "这里不以对话为中心，而是展示谁执行了操作、状态发生了什么变化，以及为什么进入下一步。"}</p>
+      </div>
+      {steps.length === 0 ? (
+        <div className="runtime-preview">
+          {preview.map((title, index) => (
+            <div className="runtime-preview-step" key={title}>
+              <span>{String(index + 1).padStart(2, "0")}</span>
+              <strong>{title}</strong>
+            </div>
+          ))}
+          <div className="runtime-preview-note">
+            <Wrench size={16} />
+            <span>{mode === "tool-calling"
+              ? "可以尝试：现在上海几点？请使用时间工具。"
+              : "可以尝试：解释一下天空为什么是蓝色的。"}</span>
+          </div>
+        </div>
+      ) : steps.map((runtimeStep, index) => (
+        <button
+          className={`runtime-step-card ${activeStepId === runtimeStep.id ? "is-active" : ""}`}
+          key={runtimeStep.id}
+          onClick={() => onSelectStep(runtimeStep.id)}
+        >
+          <span className="runtime-step-index">{String(index + 1).padStart(2, "0")}</span>
+          <span className={`runtime-step-dot actor-${runtimeStep.actor}`} />
+          <span className="runtime-step-copy">
+            <span className="runtime-step-meta">
+              {actorLabel(runtimeStep.actor)} · {visibilityLabel(runtimeStep.visibility)}
+            </span>
+            <strong>{runtimeStep.title}</strong>
+            <small>{runtimeStep.summary}</small>
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function RuntimeStepInspector({ step, trace }: { step: RuntimeStep | null; trace: TraceRun | null }) {
+  return (
+    <aside className="inspector runtime-step-inspector">
+      <header className="inspector-header">
+        <div>
+          <div className="eyebrow">运行步骤</div>
+          <h2>{step?.title ?? "选择一个步骤"}</h2>
+        </div>
+        <span className="model-pill"><CircleDot size={14} />{trace?.model ?? "DeepSeek"}</span>
+      </header>
+      {step ? (
+        <div className="step-detail-scroll">
+          <section className="step-explanation">
+            <div className="step-badges">
+              <span>{actorLabel(step.actor)}</span><span>{visibilityLabel(step.visibility)}</span>
+            </div>
+            <p>{step.summary}</p>
+          </section>
+          <section className="why-card">
+            <div className="section-label">为什么进入下一步</div>
+            <p>{step.transitionReason}</p>
+          </section>
+          <ArtifactSection title="输入" artifacts={step.input} />
+          <ArtifactSection title="输出" artifacts={step.output} />
+          <ArtifactSection title="状态变化" artifacts={step.stateChange} />
+          <ArtifactSection title="原始依据" artifacts={step.raw} />
+        </div>
+      ) : (
+        <div className="inspector-empty-runtime">
+          <div className="empty-runtime-mark"><Activity size={22} /></div>
+          <h3>选择一个运行步骤</h3>
+          <p>运行后，这里会解释每项数据由谁产生、为什么发生下一步，以及哪些信息可以直接观察。</p>
+          <div className="visibility-legend">
+            <span><i className="observed-dot" />直接观察</span>
+            <span><i className="inferred-dot" />合理推断</span>
+            <span><i className="provider-dot" />模型服务内部处理</span>
+          </div>
+        </div>
+      )}
+    </aside>
+  );
+}
+
+const actorLabel = (actor: RuntimeStep["actor"]) => ({
+  user: "用户",
+  runtime: "Agent Runtime",
+  model: "模型",
+  provider: "模型服务",
+  tool: "工具",
+})[actor];
+
+const visibilityLabel = (visibility: RuntimeStep["visibility"]) => ({
+  observed: "直接观察",
+  inferred: "合理推断",
+  "provider-managed": "服务内部处理",
+})[visibility];
+
+function ArtifactSection({ title, artifacts }: { title: string; artifacts?: RuntimeStep["input"] }) {
+  if (!artifacts?.length) return null;
+  return (
+    <section className="artifact-section">
+      <div className="section-label">{title}</div>
+      {artifacts.map((artifact, index) => (
+        <div className="artifact" key={`${artifact.label}-${index}`}>
+          <strong>{artifact.label}</strong>
+          {artifact.format === "text" ? <p>{String(artifact.value ?? "")}</p> : (
+            <pre>{artifact.format === "code" ? String(artifact.value ?? "") : JSON.stringify(artifact.value, null, 2)}</pre>
+          )}
+        </div>
+      ))}
     </section>
   );
 }

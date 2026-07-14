@@ -40,6 +40,41 @@ export type ToolExecution = {
   error?: string;
 };
 
+export type RuntimeActor = "user" | "runtime" | "model" | "provider" | "tool";
+
+export type RuntimeVisibility = "observed" | "inferred" | "provider-managed";
+
+export type RuntimeStepKind =
+  | "input"
+  | "context"
+  | "model"
+  | "provider"
+  | "decision"
+  | "parse"
+  | "tool"
+  | "observation"
+  | "output";
+
+export type RuntimeArtifact = {
+  label: string;
+  value: unknown;
+  format?: "text" | "json" | "code";
+};
+
+export type RuntimeStep = {
+  id: string;
+  kind: RuntimeStepKind;
+  title: string;
+  summary: string;
+  actor: RuntimeActor;
+  visibility: RuntimeVisibility;
+  transitionReason: string;
+  input?: RuntimeArtifact[];
+  output?: RuntimeArtifact[];
+  stateChange?: RuntimeArtifact[];
+  raw?: RuntimeArtifact[];
+};
+
 export type ReActParsedStep = {
   thought?: string;
   action?: string;
