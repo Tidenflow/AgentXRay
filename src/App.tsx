@@ -676,7 +676,7 @@ export function App() {
         onPointerDown={(event) => startResize("workspace", event)}
         role="separator"
       />
-      {selectedMode.id === 'basic' || selectedMode.id === 'tool-calling' || selectedMode.id === 'react' ? (
+      {selectedMode.id === 'basic' || selectedMode.id === 'tool-calling' || selectedMode.id === 'react' || selectedMode.id === 'plan-execute' ? (
         <RuntimeStepInspector step={activeStep} trace={activeTrace} />
       ) : (
         <TraceInspector activeTab={activeTab} setActiveTab={setActiveTab} trace={activeTrace} />
@@ -792,9 +792,6 @@ function ChatPane({
     return message.role === "assistant" && (!!message.content || !!message.tool_calls?.length);
   });
 
-  const isPlanExecuteTrace =
-    trace?.mode === "plan-execute" && isPlanExecuteResult(trace.requestPayload);
-
   return (
     <section className="chat-pane">
       <header className="chat-header">
@@ -818,17 +815,12 @@ function ChatPane({
       </nav>
 
       <div className="chat-scroll">
-        {mode.id === 'basic' || mode.id === 'tool-calling' || mode.id === 'react' ? (
+        {mode.id === 'basic' || mode.id === 'tool-calling' || mode.id === 'react' || mode.id === 'plan-execute' ? (
           <RuntimeTimeline
             activeStepId={activeStepId}
             mode={mode.id}
             onSelectStep={onSelectStep}
             steps={runtimeSteps}
-          />
-        ) : isPlanExecuteTrace ? (
-          <PlanExecuteChatView
-            result={trace!.requestPayload as PlanExecuteResult}
-            userPrompt={trace!.userPrompt}
           />
         ) : chatMessages.length > 0 ? (
           chatMessages.map((message) => (
@@ -963,6 +955,8 @@ function RuntimeTimeline({
     ? ["声明可用工具", "模型选择下一步", "模型服务解析", "参数解析与路由", "执行工具", "回填工具结果", "生成最终回答"]
     : mode === 'react'
       ? ['组装 ReAct 请求', '模型生成 Thought / Action', '解析并执行工具', '追加 Observation', '进入下一轮或输出 Final Answer']
+      : mode === 'plan-execute'
+        ? ['Planner 生成计划', 'Runtime 解析步骤', 'Executor 顺序执行', '汇总 Step Results', 'Synthesizer 生成最终回答']
       : ["接收用户目标", "组装模型请求", "模型生成 Token", "模型服务包装响应", "提取最终回答"];
 
   return (
@@ -988,6 +982,8 @@ function RuntimeTimeline({
               ? "可以尝试：现在上海几点？请使用时间工具。"
               : mode === 'react'
                 ? '可以尝试：计算 128 × 64，并使用工具检查结果。'
+                : mode === 'plan-execute'
+                  ? '可以尝试：制定三步学习计划，并说明每一步的目标。'
                 : "可以尝试：解释一下天空为什么是蓝色的。"}</span>
           </div>
         </div>

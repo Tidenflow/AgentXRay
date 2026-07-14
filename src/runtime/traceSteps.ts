@@ -53,10 +53,34 @@ type ReActTraceData = {
   maxRounds?: number;
 };
 
+type PlanTraceStep = {
+  step: number;
+  description: string;
+  executorSystemPrompt: string;
+  executorRequestPayload: unknown;
+  executorResponsePayload: unknown;
+  toolExecutions: ToolExecution[];
+  followUpRequestPayload: unknown | null;
+  followUpResponsePayload: unknown | null;
+  stepResult: string;
+};
+
+type PlanExecuteTraceData = {
+  plannerRequestPayload?: ApiPayload;
+  plannerResponsePayload?: ApiPayload;
+  plan?: string[];
+  steps?: PlanTraceStep[];
+  synthesizerRequestPayload?: ApiPayload;
+  synthesizerResponsePayload?: ApiPayload;
+  finalAnswer?: string;
+  toolDefinitions?: unknown[];
+};
+
 const step = (value: RuntimeStep) => value;
 
 export function runtimeStepsFromTrace(trace: TraceRun): RuntimeStep[] {
   if (trace.mode === 'react') return reactRuntimeSteps(trace);
+  if (trace.mode === 'plan-execute') return planExecuteRuntimeSteps(trace);
   if (trace.mode === "tool-calling") return toolCallingSteps(trace);
   if (trace.mode === "basic") return basicSteps(trace);
   return legacySteps(trace);
@@ -270,6 +294,171 @@ function reactRuntimeSteps(trace: TraceRun): RuntimeStep[] {
     id: 'final', group: '完成', kind: 'output', title: '展示最终回答', summary: trace.finalAnswer || '没有返回最终文本。',
     actor: 'runtime', visibility: 'observed',
     transitionReason: data.finalRequestPayload ? '最大轮数后的最终合成已完成，本次运行结束。' : 'Runtime 已识别到 Final Answer，本次 ReAct 循环结束。',
+    output: [{ label: '展示给用户的回答', value: trace.finalAnswer, format: 'text' }],
+  }));
+
+  return steps;
+}
+
+function planExecuteRuntimeSteps(trace: TraceRun): RuntimeStep[] {
+  const data = trace.requestPayload as PlanExecuteTraceData;
+  const plannerRequest = data.plannerRequestPayload ?? {};
+  const plannerResponse = data.plannerResponsePayload ?? {};
+  const plannerMessage = plannerResponse.choices?.[0]?.message;
+  const plan = data.plan ?? [];
+  const executorSteps = data.steps ?? [];
+  const steps: RuntimeStep[] = [
+    step({
+      id: 'goal', group: '准备阶段', kind: 'input', title: '接收用户目标', summary: trace.userPrompt,
+      actor: 'user', visibility: 'observed', transitionReason: 'Runtime 将用户目标交给 Planner 进行任务分解。',
+      output: [{ label: '用户目标', value: trace.userPrompt, format: 'text' }],
+    }),
+    step({
+      id: 'plan-planner-request', group: 'Planner', kind: 'context', title: '组装 Planner 请求',
+      summary: 'Runtime 构造只负责拆解任务、不直接执行任务的 Planner 上下文。', actor: 'runtime', visibility: 'observed',
+      transitionReason: 'Planner 需要基于原始目标生成一组有顺序的可执行步骤。',
+      input: [{ label: 'Planner 消息', value: plannerRequest.messages ?? [], format: 'json' }],
+      output: [{ label: 'Planner 请求体', value: plannerRequest, format: 'json' }],
+    }),
+    step({
+      id: 'plan-planner-model', group: 'Planner', kind: 'model', title: 'Planner 生成执行计划',
+      summary: `模型为当前目标生成 ${plan.length} 个候选执行步骤。`, actor: 'model', visibility: 'inferred',
+      transitionReason: '模型服务将计划文本包装为 Chat Completion 响应。',
+      input: [{ label: 'Planner 输入消息', value: plannerRequest.messages ?? [], format: 'json' }],
+      output: [{ label: '模型生成的计划文本', value: plannerMessage?.content ?? '', format: 'text' }],
+    }),
+    step({
+      id: 'plan-planner-provider', group: 'Planner', kind: 'provider', title: '模型服务返回 Planner 响应',
+      summary: 'DeepSeek 将 Planner 输出放入 Assistant message.content。', actor: 'provider', visibility: 'observed',
+      transitionReason: 'Runtime 接下来从可观察文本中解析结构化步骤列表。',
+      input: [{ label: 'Planner Assistant 消息', value: plannerMessage ?? null, format: 'json' }],
+      output: [{ label: 'Planner API 响应', value: plannerResponse, format: 'json' }],
+    }),
+    step({
+      id: 'plan-planner-parse', group: 'Planner', kind: 'parse', title: '解析有序执行计划',
+      summary: `Runtime 得到 ${plan.length} 个按顺序执行的步骤。`, actor: 'runtime', visibility: 'observed',
+      transitionReason: plan.length ? 'Runtime 从第一步开始顺序执行计划。' : '没有可执行步骤，Runtime 将直接进入结果合成阶段。',
+      input: [{ label: 'Planner 原始文本', value: plannerMessage?.content ?? '', format: 'text' }],
+      output: [{ label: '结构化 Plan', value: plan, format: 'json' }],
+    }),
+  ];
+
+  executorSteps.forEach((executor) => {
+    const group = `Executor · Step ${executor.step}`;
+    const request = executor.executorRequestPayload as ApiPayload;
+    const response = executor.executorResponsePayload as ApiPayload;
+    const assistantMessage = response?.choices?.[0]?.message;
+    const calls = assistantMessage?.tool_calls ?? [];
+    const executions = executor.toolExecutions ?? [];
+
+    steps.push(step({
+      id: `plan-executor-${executor.step}-request`, group, kind: 'context', title: `构造 Step ${executor.step} 执行上下文`,
+      summary: executor.description, actor: 'runtime', visibility: 'observed',
+      transitionReason: '每个 Executor Step 使用自己的系统指令、当前步骤和完整计划独立调用模型。',
+      input: [
+        { label: '当前步骤', value: executor.description, format: 'text' },
+        { label: 'Executor System Prompt', value: executor.executorSystemPrompt, format: 'text' },
+      ],
+      output: [{ label: 'Executor 请求体', value: request, format: 'json' }],
+    }));
+    steps.push(step({
+      id: `plan-executor-${executor.step}-model`, group, kind: 'model', title: `Step ${executor.step}：模型执行计划步骤`,
+      summary: calls.length ? `模型请求调用 ${calls.length} 个工具。` : '模型直接生成该步骤的结果。',
+      actor: 'model', visibility: 'inferred',
+      transitionReason: calls.length ? '模型服务将工具调用表示解码为结构化 tool_calls。' : '模型服务返回普通 Assistant 内容作为步骤结果。',
+      input: [{ label: '步骤消息与工具定义', value: request, format: 'json' }],
+      output: [{ label: '模型服务暴露的决策', value: assistantMessage ?? null, format: 'json' }],
+    }));
+    steps.push(step({
+      id: `plan-executor-${executor.step}-provider`, group, kind: 'provider', title: `Step ${executor.step}：模型服务包装响应`,
+      summary: calls.length ? 'DeepSeek 将模型决策暴露为 message.tool_calls。' : 'DeepSeek 将步骤结果暴露为 message.content。',
+      actor: 'provider', visibility: calls.length ? 'provider-managed' : 'observed',
+      transitionReason: calls.length ? 'Runtime 将解析并路由每一个工具调用。' : '没有工具调用，Runtime 可以直接记录 Step Result。',
+      output: [{ label: 'Executor API 响应', value: response ?? null, format: 'json' }],
+      raw: [{ label: 'Executor 请求体', value: request ?? null, format: 'json' }],
+    }));
+
+    calls.forEach((call, index) => {
+      const execution = executions[index];
+      steps.push(step({
+        id: `plan-executor-${executor.step}-parse-${call.id}`, group, kind: 'parse', title: `解析 ${call.function.name} 请求`,
+        summary: 'Runtime 解析参数并根据 function.name 查找本地工具。', actor: 'runtime', visibility: 'observed',
+        transitionReason: `Runtime 将把解析后的参数交给 ${call.function.name}。`,
+        input: [{ label: '原始 arguments', value: call.function.arguments, format: 'code' }],
+        output: [{ label: '解析后的参数', value: execution?.arguments ?? call.function.arguments, format: 'json' }],
+      }));
+      steps.push(step({
+        id: `plan-executor-${executor.step}-tool-${call.id}`, group, kind: 'tool', title: `执行 ${call.function.name}`,
+        summary: execution?.ok === false ? execution.error ?? '工具执行失败。' : 'Runtime 调用本地工具；模型本身不会执行工具。',
+        actor: 'tool', visibility: 'observed', transitionReason: 'Runtime 将工具结果关联到 tool_call_id 并写回步骤上下文。',
+        input: [{ label: '工具参数', value: execution?.arguments ?? null, format: 'json' }],
+        output: [{ label: '工具结果', value: execution?.content ?? null, format: 'text' }],
+      }));
+    });
+
+    if (executor.followUpRequestPayload) {
+      const followUpRequest = executor.followUpRequestPayload as ApiPayload;
+      const followUpResponse = executor.followUpResponsePayload as ApiPayload;
+      const followUpMessage = followUpResponse?.choices?.[0]?.message;
+      steps.push(step({
+        id: `plan-executor-${executor.step}-append-tools`, group, kind: 'observation', title: '将工具结果写回步骤上下文',
+        summary: 'Runtime 追加 Assistant 工具请求和 role=tool 结果。', actor: 'runtime', visibility: 'observed',
+        transitionReason: 'Executor 需要读取工具结果，才能完成当前计划步骤。',
+        stateChange: [{ label: '更新后的消息列表', value: followUpRequest.messages ?? [], format: 'json' }],
+        raw: [{ label: '步骤二次请求体', value: followUpRequest, format: 'json' }],
+      }));
+      steps.push(step({
+        id: `plan-executor-${executor.step}-follow-up-model`, group, kind: 'model', title: '根据工具结果完成步骤',
+        summary: '模型基于当前步骤和工具结果生成 Step Result。', actor: 'model', visibility: 'inferred',
+        transitionReason: '模型服务返回普通 Assistant 文本。',
+        input: [{ label: '更新后的步骤上下文', value: followUpRequest.messages ?? [], format: 'json' }],
+        output: [{ label: '生成的步骤结果', value: followUpMessage?.content ?? '', format: 'text' }],
+      }));
+      steps.push(step({
+        id: `plan-executor-${executor.step}-follow-up-provider`, group, kind: 'provider', title: '模型服务返回步骤结果',
+        summary: 'DeepSeek 返回读取工具结果后的 Assistant 响应。', actor: 'provider', visibility: 'observed',
+        transitionReason: 'Runtime 提取文本并保存为当前 Step Result。',
+        output: [{ label: '步骤二次 API 响应', value: followUpResponse ?? null, format: 'json' }],
+      }));
+    }
+
+    steps.push(step({
+      id: `plan-executor-${executor.step}-result`, group, kind: 'output', title: `保存 Step ${executor.step} Result`,
+      summary: executor.stepResult || '该步骤没有返回文本结果。', actor: 'runtime', visibility: 'observed',
+      transitionReason: executor.step < executorSteps.length ? 'Runtime 顺序执行计划中的下一步骤。' : '所有计划步骤已执行，Runtime 进入 Synthesizer。',
+      output: [{ label: 'Step Result', value: executor.stepResult, format: 'text' }],
+    }));
+  });
+
+  const synthesizerRequest = data.synthesizerRequestPayload ?? {};
+  const synthesizerResponse = data.synthesizerResponsePayload ?? {};
+  const synthesizerMessage = synthesizerResponse.choices?.[0]?.message;
+  steps.push(step({
+    id: 'plan-synthesizer-request', group: 'Synthesizer', kind: 'context', title: '汇总计划与步骤结果',
+    summary: `Runtime 将原始目标、${plan.length} 个计划步骤和 ${executorSteps.length} 个执行结果写入合成上下文。`,
+    actor: 'runtime', visibility: 'observed', transitionReason: 'Synthesizer 负责把分散的步骤结果整理成最终回答。',
+    input: [
+      { label: '执行计划', value: plan, format: 'json' },
+      { label: '所有 Step Results', value: executorSteps.map((item) => item.stepResult), format: 'json' },
+    ],
+    output: [{ label: 'Synthesizer 请求体', value: synthesizerRequest, format: 'json' }],
+  }));
+  steps.push(step({
+    id: 'plan-synthesizer-model', group: 'Synthesizer', kind: 'model', title: 'Synthesizer 生成最终答案',
+    summary: '模型根据原始目标、完整计划和所有步骤结果生成统一回答。', actor: 'model', visibility: 'inferred',
+    transitionReason: '模型服务将最终内容包装为 Chat Completion 响应。',
+    input: [{ label: '合成消息', value: synthesizerRequest.messages ?? [], format: 'json' }],
+    output: [{ label: '生成的最终内容', value: synthesizerMessage?.content ?? '', format: 'text' }],
+  }));
+  steps.push(step({
+    id: 'plan-synthesizer-provider', group: 'Synthesizer', kind: 'provider', title: '模型服务返回最终响应',
+    summary: 'DeepSeek 返回 Synthesizer 的 Assistant 消息。', actor: 'provider', visibility: 'observed',
+    transitionReason: 'Runtime 从响应中提取最终答案。',
+    output: [{ label: 'Synthesizer API 响应', value: synthesizerResponse, format: 'json' }],
+  }));
+  steps.push(step({
+    id: 'final', group: '完成', kind: 'output', title: '展示最终回答', summary: trace.finalAnswer || '没有返回最终文本。',
+    actor: 'runtime', visibility: 'observed', transitionReason: 'Planner、所有 Executor Steps 和 Synthesizer 均已完成，本次运行结束。',
     output: [{ label: '展示给用户的回答', value: trace.finalAnswer, format: 'text' }],
   }));
 
