@@ -1,4 +1,4 @@
-import { type ReactNode, useMemo, useState } from "react";
+import { type PointerEvent as ReactPointerEvent, type ReactNode, useMemo, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -465,6 +465,9 @@ const buildTraceFromPlanExecute = (
 };
 
 export function App() {
+  const [sidebarWidth, setSidebarWidth] = useState(232);
+  const [workspaceWidth, setWorkspaceWidth] = useState(720);
+  const [activeResize, setActiveResize] = useState<"sidebar" | "workspace" | null>(null);
   const [activeMode, setActiveMode] = useState<AgentModeId>("basic");
   const [prompt, setPrompt] = useState("");
   const [conversationMessages, setConversationMessages] = useState<RuntimeMessage[]>([]);
@@ -574,8 +577,42 @@ export function App() {
 
   const selectedMode = modeOptions.find((mode) => mode.id === activeMode) ?? modeOptions[0];
 
+  const startResize = (
+    target: "sidebar" | "workspace",
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startSidebarWidth = sidebarWidth;
+    const startWorkspaceWidth = workspaceWidth;
+    setActiveResize(target);
+
+    const onMove = (moveEvent: PointerEvent) => {
+      const delta = moveEvent.clientX - startX;
+      if (target === "sidebar") {
+        setSidebarWidth(Math.max(180, Math.min(360, startSidebarWidth + delta)));
+        return;
+      }
+
+      const availableWidth = window.innerWidth - sidebarWidth - 4 - 4 - 380;
+      setWorkspaceWidth(Math.max(440, Math.min(availableWidth, startWorkspaceWidth + delta)));
+    };
+
+    const onUp = () => {
+      setActiveResize(null);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
+
   return (
-    <main className="app-shell">
+    <main
+      className={`app-shell ${activeResize ? "is-resizing" : ""}`}
+      style={{ gridTemplateColumns: `${sidebarWidth}px 4px ${workspaceWidth}px 4px minmax(380px, 1fr)` }}
+    >
       <Sidebar
         activeTrace={activeTrace}
         experiments={experiments}
@@ -588,6 +625,13 @@ export function App() {
           setError(null);
         }}
         onSelectTrace={selectTrace}
+      />
+      <div
+        aria-label="调整实验栏宽度"
+        className={`pane-resizer ${activeResize === "sidebar" ? "is-active" : ""}`}
+        onDoubleClick={() => setSidebarWidth(232)}
+        onPointerDown={(event) => startResize("sidebar", event)}
+        role="separator"
       />
       <ChatPane
         error={error}
@@ -606,6 +650,13 @@ export function App() {
         selectedModes={selectedModes}
         onToggleMode={(mode) => setSelectedModes((current) => current.includes(mode) ? current.filter((item) => item !== mode) : [...current, mode])}
         runningMode={runningMode}
+      />
+      <div
+        aria-label="调整运行时间线宽度"
+        className={`pane-resizer ${activeResize === "workspace" ? "is-active" : ""}`}
+        onDoubleClick={() => setWorkspaceWidth(720)}
+        onPointerDown={(event) => startResize("workspace", event)}
+        role="separator"
       />
       {selectedMode.id === "basic" || selectedMode.id === "tool-calling" ? (
         <RuntimeStepInspector step={activeStep} trace={activeTrace} />
