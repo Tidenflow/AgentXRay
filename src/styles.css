@@ -241,9 +241,62 @@ textarea:disabled {
 
 .chat-pane {
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto;
   border-right: 1px solid var(--line);
   background: var(--panel);
+}
+
+.experiment-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 46px;
+  padding: 7px 30px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-soft);
+}
+
+.experiment-tabs button,
+.experiment-runs button {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fffefb;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.experiment-tabs button {
+  min-height: 30px;
+  padding: 0 10px;
+}
+
+.experiment-tabs button.is-active,
+.experiment-runs button.is-active {
+  border-color: var(--ink);
+  color: var(--text);
+  box-shadow: 0 5px 14px rgba(26, 24, 20, 0.07);
+}
+
+.experiment-tabs small,
+.experiment-runs small {
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.experiment-tabs-empty {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.run-status-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--green);
 }
 
 .chat-header {
@@ -543,6 +596,88 @@ textarea:disabled {
   color: var(--muted);
   font-size: 12px;
 }
+
+.mode-selector {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 10px 10px 0;
+}
+
+.mode-selector button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.mode-selector button.is-selected {
+  border-color: var(--green);
+  background: var(--green-soft);
+  color: var(--green);
+  font-weight: 700;
+}
+
+.run-progress {
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.experiment-item {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 254, 251, 0.7);
+}
+
+.experiment-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.experiment-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.experiment-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px;
+}
+
+.experiment-runs button {
+  width: 100%;
+  min-height: 28px;
+  padding: 0 8px;
+  text-align: left;
+}
+
+.experiment-runs button small {
+  margin-left: auto;
+}
+
+.experiment-error,
+.experiment-pending {
+  padding: 5px 7px;
+  color: var(--danger);
+  font-size: 10px;
+}
+
+.experiment-pending { color: var(--muted); }
 
 .composer-toolbar button,
 .icon-button {

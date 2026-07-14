@@ -26,6 +26,14 @@ type AgentModeOption = {
   enabled: boolean;
 };
 
+type Experiment = {
+  id: string;
+  prompt: string;
+  createdAt: number;
+  runs: TraceRun[];
+  errors: Partial<Record<AgentModeId, string>>;
+};
+
 type DeepSeekResult = {
   baseUrl: string;
   model: string;
@@ -461,6 +469,10 @@ export function App() {
   const [prompt, setPrompt] = useState("");
   const [conversationMessages, setConversationMessages] = useState<RuntimeMessage[]>([]);
   const [traces, setTraces] = useState<TraceRun[]>([]);
+  const [experiments, setExperiments] = useState<Experiment[]>([]);
+  const [activeExperimentId, setActiveExperimentId] = useState<string | null>(null);
+  const [selectedModes, setSelectedModes] = useState<AgentModeId[]>(["basic", "tool-calling"]);
+  const [runningMode, setRunningMode] = useState<AgentModeId | null>(null);
   const [activeTraceId, setActiveTraceId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<InspectorTab>("input");
   const [activeStepId, setActiveStepId] = useState<string | null>(null);
@@ -485,81 +497,79 @@ export function App() {
     setActiveMode(trace.mode);
     setPrompt(trace.userPrompt);
     setConversationMessages(trace.conversationMessages);
+    const experiment = experiments.find((item) => item.runs.some((run) => run.id === trace.id));
+    setActiveExperimentId(experiment?.id ?? null);
   };
 
-  const runTrace = async () => {
-    const cleanPrompt = prompt.trim();
-    if (!cleanPrompt || isRunning) return;
-
-    setIsRunning(true);
-    setError(null);
-
-    try {
-      const turnNumber =
-        conversationMessages.filter((message) => message.role === "user").length + 1;
+  const executeMode = async (mode: AgentModeId, cleanPrompt: string) => {
+      const turnNumber = 1;
       const userMessage = toRuntimeMessage(`turn-${turnNumber}-user`, "user", cleanPrompt);
-
       const systemMessage =
-        activeMode === "tool-calling"
+        mode === "tool-calling"
           ? toolCallingSystemPromptMessage()
-          : activeMode === "react"
+          : mode === "react"
             ? reactSystemPromptMessage()
-            : activeMode === "plan-execute"
+            : mode === "plan-execute"
               ? planExecuteSystemPromptMessage()
               : systemPromptMessage();
-
-      // For ReAct / Plan-Execute, only carry forward user prompts + final assistant answers
-      const contextMessages =
-        activeMode === "react" || activeMode === "plan-execute"
-          ? conversationMessages.filter(
-              (m) =>
-                m.role === "user" ||
-                (m.role === "assistant" && !m.tool_calls?.length && m.content),
-            )
-          : conversationMessages;
-
-      const requestMessages = [systemMessage, ...contextMessages, userMessage];
-
+      const requestMessages = [systemMessage, userMessage];
       const endpoint =
-        activeMode === "tool-calling"
+        mode === "tool-calling"
           ? "/api/deepseek/tool-calling"
-          : activeMode === "react"
+          : mode === "react"
             ? "/api/deepseek/react"
-            : activeMode === "plan-execute"
+            : mode === "plan-execute"
               ? "/api/deepseek/plan-execute"
               : "/api/deepseek/chat";
-
       const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ messages: requestMessages.map(toApiMessage) }),
       });
       const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error ?? "DeepSeek request failed.");
+      return mode === "tool-calling"
+        ? buildTraceFromToolCalling(cleanPrompt, payload as ToolCallingResult, turnNumber)
+        : mode === "react"
+          ? buildTraceFromReAct(cleanPrompt, payload as ReActResult, turnNumber)
+          : mode === "plan-execute"
+            ? buildTraceFromPlanExecute(cleanPrompt, payload as PlanExecuteResult, turnNumber)
+            : buildTraceFromDeepSeek(cleanPrompt, payload as DeepSeekResult, turnNumber);
+  };
 
-      if (!response.ok) {
-        throw new Error(payload.error ?? "DeepSeek request failed.");
+  const runTrace = async () => {
+    const cleanPrompt = prompt.trim();
+    if (!cleanPrompt || isRunning || selectedModes.length === 0) return;
+
+    setIsRunning(true);
+    setError(null);
+    const experimentId = `experiment-${Date.now()}`;
+    const experiment: Experiment = { id: experimentId, prompt: cleanPrompt, createdAt: Date.now(), runs: [], errors: {} };
+    setExperiments((current) => [experiment, ...current]);
+    setActiveExperimentId(experimentId);
+    setActiveTraceId(null);
+
+    for (const mode of selectedModes) {
+      setRunningMode(mode);
+      try {
+        const trace = await executeMode(mode, cleanPrompt);
+        setTraces((current) => [trace, ...current]);
+        setExperiments((current) => current.map((item) => item.id === experimentId ? { ...item, runs: [...item.runs, trace] } : item));
+        setActiveMode(trace.mode);
+        setActiveTraceId(trace.id);
+        setConversationMessages(trace.conversationMessages);
+      } catch (runError) {
+        const message = runError instanceof Error ? runError.message : "未知运行错误。";
+        setExperiments((current) => current.map((item) => item.id === experimentId ? { ...item, errors: { ...item.errors, [mode]: message } } : item));
+        setError(message);
       }
-
-      const trace =
-        activeMode === "tool-calling"
-          ? buildTraceFromToolCalling(cleanPrompt, payload as ToolCallingResult, turnNumber)
-          : activeMode === "react"
-            ? buildTraceFromReAct(cleanPrompt, payload as ReActResult, turnNumber)
-            : activeMode === "plan-execute"
-              ? buildTraceFromPlanExecute(cleanPrompt, payload as PlanExecuteResult, turnNumber)
-              : buildTraceFromDeepSeek(cleanPrompt, payload as DeepSeekResult, turnNumber);
-
-      setTraces((current) => [trace, ...current]);
-      setConversationMessages(trace.conversationMessages);
-      setActiveTraceId(trace.id);
-      setActiveTab("input");
-      setActiveStepId(null);
-      setPrompt("");
-    } catch (runError) {
-      setError(runError instanceof Error ? runError.message : "Unknown runtime error.");
-    } finally {
-      setIsRunning(false);
     }
+
+    setRunningMode(null);
+    setIsRunning(false);
+    setActiveTab("input");
+    setActiveStepId(null);
+    setPrompt("");
   };
 
   const selectedMode = modeOptions.find((mode) => mode.id === activeMode) ?? modeOptions[0];
@@ -567,18 +577,17 @@ export function App() {
   return (
     <main className="app-shell">
       <Sidebar
-        activeMode={activeMode}
         activeTrace={activeTrace}
-        modes={modeOptions}
+        experiments={experiments}
         onNewTrace={() => {
           setActiveTraceId(null);
+          setActiveExperimentId(null);
+          setActiveStepId(null);
           setPrompt("");
           setConversationMessages([]);
           setError(null);
         }}
-        onSelectMode={setActiveMode}
         onSelectTrace={selectTrace}
-        traces={traces}
       />
       <ChatPane
         error={error}
@@ -592,6 +601,11 @@ export function App() {
         runtimeSteps={runtimeSteps}
         activeStepId={activeStep?.id ?? null}
         onSelectStep={setActiveStepId}
+        experiment={experiments.find((item) => item.id === activeExperimentId) ?? null}
+        onSelectTrace={selectTrace}
+        selectedModes={selectedModes}
+        onToggleMode={(mode) => setSelectedModes((current) => current.includes(mode) ? current.filter((item) => item !== mode) : [...current, mode])}
+        runningMode={runningMode}
       />
       {selectedMode.id === "basic" || selectedMode.id === "tool-calling" ? (
         <RuntimeStepInspector step={activeStep} trace={activeTrace} />
@@ -603,21 +617,15 @@ export function App() {
 }
 
 function Sidebar({
-  activeMode,
   activeTrace,
-  modes,
+  experiments,
   onNewTrace,
-  onSelectMode,
   onSelectTrace,
-  traces,
 }: {
-  activeMode: AgentModeId;
   activeTrace: TraceRun | null;
-  modes: AgentModeOption[];
+  experiments: Experiment[];
   onNewTrace: () => void;
-  onSelectMode: (mode: AgentModeId) => void;
   onSelectTrace: (trace: TraceRun) => void;
-  traces: TraceRun[];
 }) {
   return (
     <aside className="sidebar">
@@ -633,44 +641,28 @@ function Sidebar({
 
       <button className="new-trace-button" onClick={onNewTrace}>
         <Plus size={16} />
-        New Trace
+        新建实验
       </button>
 
       <section className="nav-section">
-        <div className="section-label">Agent Modes</div>
-        <div className="mode-list">
-          {modes.map((mode) => (
-            <button
-              className={`mode-item ${activeMode === mode.id ? "is-active" : ""}`}
-              disabled={!mode.enabled}
-              key={mode.id}
-              onClick={() => onSelectMode(mode.id)}
-            >
-              <span className="mode-dot" />
-              <span>
-                <strong>{mode.name}</strong>
-                <small>{mode.description}</small>
-              </span>
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section className="nav-section">
-        <div className="section-label">Runtime Runs</div>
+        <div className="section-label">实验记录</div>
         <div className="history-list">
-          {traces.length === 0 ? (
-            <div className="empty-list">No real traces yet.</div>
+          {experiments.length === 0 ? (
+            <div className="empty-list">还没有实验。输入一个问题，并选择要比较的 Agent 模式。</div>
           ) : (
-            traces.map((trace) => (
-              <button
-                className={`history-item ${activeTrace?.id === trace.id ? "is-active" : ""}`}
-                key={`history-${trace.id}`}
-                onClick={() => onSelectTrace(trace)}
-              >
-                <MessageSquareText size={15} />
-                <span>{trace.userPrompt}</span>
-              </button>
+            experiments.map((experiment) => (
+              <article className="experiment-item" key={experiment.id}>
+                <div className="experiment-title"><MessageSquareText size={14} /><span>{experiment.prompt}</span></div>
+                <div className="experiment-runs">
+                  {experiment.runs.map((trace) => (
+                    <button className={activeTrace?.id === trace.id ? "is-active" : ""} key={trace.id} onClick={() => onSelectTrace(trace)}>
+                      <span className="run-status-dot" />{trace.modeName}<small>{trace.durationMs}ms</small>
+                    </button>
+                  ))}
+                  {Object.entries(experiment.errors).map(([mode]) => <div className="experiment-error" key={mode}>! {mode} 运行失败</div>)}
+                  {experiment.runs.length === 0 && Object.keys(experiment.errors).length === 0 ? <div className="experiment-pending">等待运行…</div> : null}
+                </div>
+              </article>
             ))
           )}
         </div>
@@ -691,6 +683,11 @@ function ChatPane({
   runtimeSteps,
   activeStepId,
   onSelectStep,
+  experiment,
+  onSelectTrace,
+  selectedModes,
+  onToggleMode,
+  runningMode,
 }: {
   error: string | null;
   isRunning: boolean;
@@ -703,6 +700,11 @@ function ChatPane({
   runtimeSteps: RuntimeStep[];
   activeStepId: string | null;
   onSelectStep: (id: string) => void;
+  experiment: Experiment | null;
+  onSelectTrace: (trace: TraceRun) => void;
+  selectedModes: AgentModeId[];
+  onToggleMode: (mode: AgentModeId) => void;
+  runningMode: AgentModeId | null;
 }) {
   const chatMessages = visibleMessages.filter((message) => {
     if (message.role === "user" || message.role === "tool") return true;
@@ -725,6 +727,15 @@ function ChatPane({
           {trace?.model ?? "deepseek-v4-pro"}
         </div>
       </header>
+
+      <nav className="experiment-tabs" aria-label="实验结果">
+          {experiment?.runs.map((run) => (
+            <button className={trace?.id === run.id ? "is-active" : ""} key={run.id} onClick={() => onSelectTrace(run)}>
+              <span className="run-status-dot" />{run.modeName}<small>{run.durationMs}ms</small>
+            </button>
+          ))}
+          {!experiment?.runs.length ? <span className="experiment-tabs-empty">实验结果会显示在这里</span> : null}
+      </nav>
 
       <div className="chat-scroll">
         {mode.id === "basic" || mode.id === "tool-calling" ? (
@@ -792,13 +803,7 @@ function ChatPane({
 
       <footer className="composer">
         <div className="composer-toolbar">
-          <span>
-            {mode.enabled
-              ? trace
-                ? "continue with the current runtime context"
-                : "describe a goal, then inspect every runtime step"
-              : "mode not wired yet"}
-          </span>
+          <span>新建运行实验 · 同一个问题，对比不同 Agent 模式</span>
           <button aria-label="Settings">
             <Settings2 size={15} />
           </button>
@@ -809,6 +814,17 @@ function ChatPane({
             {error}
           </div>
         ) : null}
+        <div className="mode-selector" aria-label="选择运行模式">
+          {modeOptions.map((option) => {
+            const selected = selectedModes.includes(option.id);
+            const running = runningMode === option.id;
+            return (
+              <button className={selected ? "is-selected" : ""} disabled={isRunning} key={option.id} onClick={() => onToggleMode(option.id)}>
+                <span>{running ? "◌" : selected ? "✓" : "+"}</span>{option.name}
+              </button>
+            );
+          })}
+        </div>
         <div className="input-row">
           <textarea
             aria-label="Prompt"
@@ -821,10 +837,10 @@ function ChatPane({
           <button
             className="run-button"
             aria-label="Run trace"
-            disabled={isRunning || !prompt.trim() || !mode.enabled}
+            disabled={isRunning || !prompt.trim() || selectedModes.length === 0}
             onClick={onRun}
           >
-            <Play size={16} />
+            {isRunning ? <span className="run-progress">{selectedModes.findIndex((item) => item === runningMode) + 1}/{selectedModes.length}</span> : <Play size={16} />}
           </button>
         </div>
       </footer>
