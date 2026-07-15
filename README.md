@@ -243,17 +243,12 @@ Compare the population density of Tokyo, London, and New York City. For each cit
 
 ## Architecture
 
-AgentXRay runs entirely in the browser with a Vite dev-server proxy — no separate backend process.
+AgentXRay is a Tauri v2 desktop app. React owns the orchestration, while thin Rust plugins provide HTTP access and SQLite persistence.
 
 ```
-┌─────────────┐     ┌─────────────────────────────┐     ┌──────────────────┐
-│   Browser   │────▶│   Vite Dev Server (:5173)    │────▶│  DeepSeek API    │
-│             │     │                             │     │  api.deepseek.com│
-│  React App  │     │  /api/deepseek/chat          │     │                  │
-│  (Trace UI) │◀────│  /api/deepseek/tool-calling  │◀────│  /v1/chat/       │
-│             │     │  /api/deepseek/react          │     │   completions    │
-│             │     │  /api/deepseek/plan-execute   │     │                  │
-└─────────────┘     └─────────────────────────────┘     └──────────────────┘
+React UI + agent runners ── Tauri HTTP plugin ── DeepSeek-compatible API
+           │
+           └────────────── Tauri SQL plugin ─── SQLite history/settings
 ```
 
 ### Data Flow
@@ -266,13 +261,12 @@ Each agent mode follows the same trace pipeline:
 2. App.tsx builds mode-specific request body
    (system prompt, messages, tools, maxRounds...)
          │
-3. Vite proxy forwards to DeepSeek API
-   (API key injected server-side, never reaches browser)
+3. The Tauri HTTP plugin sends the request to the configured API
          │
-4. Proxy executes local tools (calculate, get_current_datetime)
+4. The TypeScript runtime executes local tools (calculate, get_current_datetime)
    when the model returns tool_calls
          │
-5. Proxy returns a unified result object
+5. The runner returns a unified result object
    (request payload, response payload, tool executions, duration)
          │
 6. App.tsx trace builder constructs a TraceRun
@@ -284,16 +278,9 @@ Each agent mode follows the same trace pipeline:
    Sent to LLM │ LLM Response │ Tool Calls │ Memory │ Raw Trace
 ```
 
-### API Proxy Endpoints
+### Agent runners
 
-| Endpoint | Method | Key Request Fields | Returns |
-|---|---|---|---|
-| `/api/deepseek/chat` | POST | `prompt`, `temperature` | `DeepSeekResult` — request/response payloads, model, duration |
-| `/api/deepseek/tool-calling` | POST | `prompt`, `temperature` | `ToolCallingResult` — extends DeepSeekResult with `toolDefinitions`, `toolExecutions`, `followUpRequestPayload` |
-| `/api/deepseek/react` | POST | `prompt`, `temperature`, `maxRounds` | `ReActResult` — `reactSteps[]` with per-round parsed Thought/Action/Observation |
-| `/api/deepseek/plan-execute` | POST | `prompt`, `temperature` | `PlanExecuteResult` — `plan[]`, `steps[]` with per-step tool executions |
-
-All endpoints share the same DeepSeek configuration from `.env`. The proxy:
+`src/agent` exposes Basic, Tool Calling, ReAct, and Plan-and-Execute runners with the same trace result shapes used by the UI. The runtime:
 - Strips `reasoning_content` from model responses (hidden reasoning is outside runtime inspection scope)
 - Handles tool execution locally — no external tool server needed
 - Measures and returns `durationMs` for every call
@@ -393,50 +380,25 @@ cd AgentXRay
 npm install
 ```
 
-### 2. Set your API key
+### 2. Run the desktop app
 
 ```bash
-cp .env.example .env
+npm run tauri dev
 ```
 
-Edit `.env` and fill in your DeepSeek API key:
-
-```env
-DEEPSEEK_API_KEY=sk-your-deepseek-api-key
-DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
-DEEPSEEK_TEMPERATURE=0.7
-```
-
-### 3. Run the dev server
-
-```bash
-npm run dev
-```
-
-Open `http://localhost:5173`, select an agent mode, type a prompt, and watch the trace inspector light up.
+Open Run Settings, enter your API key, base URL and model, then save. Settings and trace history are stored in local SQLite.
 
 ### 4. (Optional) Build for production
 
 ```bash
-npm run build
-npm run preview
+npm run tauri build
 ```
 
 ---
 
 ## Configuration
 
-All configuration lives in `.env` (copy from `.env.example`):
-
-| Variable | Default | Description |
-|---|---|---|
-| `DEEPSEEK_API_KEY` | *(required)* | Your DeepSeek API key |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API base URL — change only for a proxy or a self-hosted DeepSeek-compatible endpoint |
-| `DEEPSEEK_MODEL` | `deepseek-v4-flash` | `deepseek-v4-flash` for speed, `deepseek-v4-pro` for quality |
-| `DEEPSEEK_TEMPERATURE` | `0.7` | Sampling temperature (0.0–2.0) |
-
-The Vite dev server proxies all `/api/deepseek/*` calls server-side, so your API key never reaches the browser.
+Configuration is edited in Run Settings and stored locally in `agentxray.db`. Defaults are `https://api.deepseek.com`, `deepseek-v4-flash`, and temperature `0.7`.
 
 ---
 
@@ -446,13 +408,13 @@ The Vite dev server proxies all `/api/deepseek/*` calls server-side, so your API
 |---|---|
 | Frontend | React 19 + TypeScript |
 | Build | Vite 6 |
-| State | Zustand (trace history persistence) + React `useState` (component-local) |
+| State | React `useState` + SQLite persistence |
 | Icons | Lucide React |
 | Styling | Plain CSS (warm palette, three-column CSS Grid, min-width 1180px) |
-| API Proxy | Vite dev-server middleware (`/api/deepseek/*`) |
+| Desktop runtime | Tauri v2 with HTTP and SQL plugins |
 | LLM | DeepSeek (configurable base URL & model) |
 
-No separate backend. The Vite dev server proxies API calls so your API key never leaks to the browser.
+No separate backend process is required.
 
 ---
 
@@ -496,14 +458,13 @@ Hidden reasoning ❌ (outside runtime inspection scope)
 .
 ├── index.html              # HTML entry point
 ├── package.json            # Dependencies & scripts
-├── vite.config.ts          # Vite config + all DeepSeek API proxy middleware (1100+ lines)
-│                           #   /api/deepseek/chat          — Basic LLM
-│                           #   /api/deepseek/tool-calling   — Tool Calling
-│                           #   /api/deepseek/react          — ReAct loop
-│                           #   /api/deepseek/plan-execute   — Plan-and-Execute pipeline
+├── vite.config.ts          # Frontend build/dev configuration
+├── src-tauri/              # Tauri shell, HTTP/SQL plugins, SQLite migrations
 ├── tsconfig.json           # TypeScript config
-├── .env.example            # Environment variable template
 ├── src/
+│   ├── agent/              # Four agent runners, parsing, tools, provider client
+│   ├── config/             # SQLite-backed runtime settings
+│   ├── db/                 # Experiment and trace persistence
 │   ├── main.tsx            # React entry point
 │   ├── App.tsx             # Main application — UI components, state, trace builders, inspector panels (1700+ lines)
 │   ├── runtime/
