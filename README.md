@@ -388,7 +388,7 @@ npm run tauri dev
 
 Open Run Settings, enter your API key, base URL and model, then save. Settings and trace history are stored in local SQLite.
 
-### 4. (Optional) Build for production
+### 3. (Optional) Build for production
 
 ```bash
 npm run tauri build
@@ -398,7 +398,7 @@ npm run tauri build
 
 ## Configuration
 
-Configuration is edited in Run Settings and stored locally in `agentxray.db`. Defaults are `https://api.deepseek.com`, `deepseek-v4-flash`, and temperature `0.7`.
+Configuration is edited in Run Settings and stored locally in `agentxray.db`. Defaults are `https://api.deepseek.com`, `deepseek-v4-flash`, and temperature `0.7`. Change the base URL only when using a proxy or a self-hosted DeepSeek-compatible endpoint.
 
 ---
 
