@@ -1,4 +1,4 @@
-import { type PointerEvent as ReactPointerEvent, type ReactNode, useMemo, useState } from "react";
+import { type PointerEvent as ReactPointerEvent, type ReactNode, useEffect, useMemo, useState } from "react";
 import {
   Activity,
   AlertCircle,
@@ -16,6 +16,10 @@ import {
 } from "lucide-react";
 import type { AgentModeId, PlanExecuteStep, ReActStep, RuntimeMessage, RuntimeStep, ToolExecution, TraceRun } from "./types";
 import { runtimeStepsFromTrace } from "./runtime/traceSteps";
+import { runMode } from "./agent";
+import type { AgentConfig } from "./agent";
+import { defaultSettings, loadSettings, saveSettings } from "./config/settings";
+import { loadHistory, saveExperiment, saveTraceRun } from "./db";
 
 type InspectorTab = "input" | "output" | "tools" | "memory" | "raw";
 
@@ -469,6 +473,8 @@ export function App() {
   const [workspaceWidth, setWorkspaceWidth] = useState(720);
   const [activeResize, setActiveResize] = useState<"sidebar" | "workspace" | null>(null);
   const [temperature, setTemperature] = useState(0.7);
+  const [agentConfig, setAgentConfig] = useState<AgentConfig>(defaultSettings);
+  const [maxRounds, setMaxRounds] = useState(4);
   const [systemPrompt, setSystemPrompt] = useState("");
   const [showRunSettings, setShowRunSettings] = useState(false);
   const [activeMode, setActiveMode] = useState<AgentModeId>("basic");
@@ -484,6 +490,15 @@ export function App() {
   const [activeStepId, setActiveStepId] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void Promise.all([loadSettings(), loadHistory()]).then(([settings, history]) => {
+      setAgentConfig(settings);
+      setTemperature(settings.temperature);
+      setExperiments(history.experiments);
+      setTraces(history.traces);
+    }).catch((loadError) => setError(`无法加载本地数据：${loadError instanceof Error ? loadError.message : "未知错误"}`));
+  }, []);
 
   const activeTrace = useMemo(
     () => traces.find((trace) => trace.id === activeTraceId) ?? null,
@@ -525,24 +540,11 @@ export function App() {
           }
         : defaultSystemMessage;
       const requestMessages = [systemMessage, userMessage];
-      const endpoint =
-        mode === "tool-calling"
-          ? "/api/deepseek/tool-calling"
-          : mode === "react"
-            ? "/api/deepseek/react"
-            : mode === "plan-execute"
-              ? "/api/deepseek/plan-execute"
-              : "/api/deepseek/chat";
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: requestMessages.map(toApiMessage),
-          temperature,
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error ?? "DeepSeek request failed.");
+      const payload = await runMode(mode, {
+        messages: requestMessages.map(toApiMessage),
+        temperature,
+        maxRounds,
+      }, { ...agentConfig, temperature });
       return mode === "tool-calling"
         ? buildTraceFromToolCalling(cleanPrompt, payload as ToolCallingResult, turnNumber)
         : mode === "react"
@@ -560,9 +562,11 @@ export function App() {
     setError(null);
     const experimentId = `experiment-${Date.now()}`;
     const experiment: Experiment = { id: experimentId, prompt: cleanPrompt, createdAt: Date.now(), runs: [], errors: {} };
+    await saveExperiment(experiment);
     setExperiments((current) => [experiment, ...current]);
     setActiveExperimentId(experimentId);
     setActiveTraceId(null);
+    const persistedErrors: Experiment["errors"] = {};
 
     for (const mode of selectedModes) {
       setRunningMode(mode);
@@ -573,10 +577,13 @@ export function App() {
         setActiveMode(trace.mode);
         setActiveTraceId(trace.id);
         setConversationMessages(trace.conversationMessages);
+        await saveTraceRun(experimentId, trace);
       } catch (runError) {
         const message = runError instanceof Error ? runError.message : "未知运行错误。";
+        persistedErrors[mode] = message;
         setExperiments((current) => current.map((item) => item.id === experimentId ? { ...item, errors: { ...item.errors, [mode]: message } } : item));
         setError(message);
+        await saveExperiment({ ...experiment, errors: persistedErrors });
       }
     }
 
@@ -664,6 +671,11 @@ export function App() {
         runningMode={runningMode}
         temperature={temperature}
         onTemperatureChange={setTemperature}
+        agentConfig={agentConfig}
+        onAgentConfigChange={setAgentConfig}
+        maxRounds={maxRounds}
+        onMaxRoundsChange={setMaxRounds}
+        onSaveSettings={() => saveSettings({ ...agentConfig, temperature }).then(() => setError(null)).catch((saveError) => setError(saveError instanceof Error ? saveError.message : "保存设置失败"))}
         systemPrompt={systemPrompt}
         onSystemPromptChange={setSystemPrompt}
         showRunSettings={showRunSettings}
@@ -759,6 +771,11 @@ function ChatPane({
   runningMode,
   temperature,
   onTemperatureChange,
+  agentConfig,
+  onAgentConfigChange,
+  maxRounds,
+  onMaxRoundsChange,
+  onSaveSettings,
   systemPrompt,
   onSystemPromptChange,
   showRunSettings,
@@ -782,6 +799,11 @@ function ChatPane({
   runningMode: AgentModeId | null;
   temperature: number;
   onTemperatureChange: (value: number) => void;
+  agentConfig: AgentConfig;
+  onAgentConfigChange: (value: AgentConfig) => void;
+  maxRounds: number;
+  onMaxRoundsChange: (value: number) => void;
+  onSaveSettings: () => void;
   systemPrompt: string;
   onSystemPromptChange: (value: string) => void;
   showRunSettings: boolean;
@@ -801,7 +823,7 @@ function ChatPane({
         </div>
         <div className="model-pill">
           <CircleDot size={14} />
-          {trace?.model ?? "deepseek-v4-pro"}
+          {trace?.model ?? agentConfig.model}
         </div>
       </header>
 
@@ -877,6 +899,18 @@ function ChatPane({
         </div>
         {showRunSettings ? (
           <section className="run-settings-panel">
+            <label className="system-prompt-control">
+              <span><strong>API Key</strong><small>仅保存在本机 SQLite</small></span>
+              <input type="password" autoComplete="off" placeholder="sk-..." value={agentConfig.apiKey} onChange={(event) => onAgentConfigChange({ ...agentConfig, apiKey: event.target.value })} />
+            </label>
+            <label className="system-prompt-control">
+              <span><strong>Base URL</strong><small>OpenAI 兼容接口根地址</small></span>
+              <input value={agentConfig.baseUrl} onChange={(event) => onAgentConfigChange({ ...agentConfig, baseUrl: event.target.value })} />
+            </label>
+            <label className="system-prompt-control">
+              <span><strong>Model</strong><small>请求使用的模型名称</small></span>
+              <input value={agentConfig.model} onChange={(event) => onAgentConfigChange({ ...agentConfig, model: event.target.value })} />
+            </label>
             <label className="temperature-control">
               <span><strong>Temperature</strong><small>输出随机性</small></span>
               <input
@@ -890,6 +924,10 @@ function ChatPane({
               <output>{temperature.toFixed(1)}</output>
             </label>
             <label className="system-prompt-control">
+              <span><strong>ReAct Max Rounds</strong><small>1–8 轮</small></span>
+              <input type="number" min="1" max="8" value={maxRounds} onChange={(event) => onMaxRoundsChange(Math.max(1, Math.min(8, Number(event.target.value))))} />
+            </label>
+            <label className="system-prompt-control">
               <span><strong>System Prompt</strong><small>与各模式的运行协议合并</small></span>
               <textarea
                 onChange={(event) => onSystemPromptChange(event.target.value)}
@@ -898,6 +936,7 @@ function ChatPane({
                 value={systemPrompt}
               />
             </label>
+            <button type="button" className="settings-save-button" onClick={onSaveSettings}>保存设置</button>
           </section>
         ) : null}
         {error ? (

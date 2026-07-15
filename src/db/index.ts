@@ -1,0 +1,12 @@
+import Database from "@tauri-apps/plugin-sql";
+import type { AgentModeId, TraceRun } from "../types";
+
+export type StoredExperiment = { id: string; prompt: string; createdAt: number; runs: TraceRun[]; errors: Partial<Record<AgentModeId, string>> };
+let database: Promise<Database> | null = null;
+const db = () => database ??= Database.load("sqlite:agentxray.db");
+
+export async function getSetting(key: string) { const rows = await (await db()).select<Array<{ value: string }>>("SELECT value FROM settings WHERE key = $1", [key]); return rows[0]?.value ?? null; }
+export async function setSetting(key: string, value: string) { await (await db()).execute("INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [key, value]); }
+export async function saveExperiment(experiment: StoredExperiment) { await (await db()).execute("INSERT INTO experiments (id, prompt, created_at, errors) VALUES ($1, $2, $3, $4) ON CONFLICT(id) DO UPDATE SET prompt = excluded.prompt, errors = excluded.errors", [experiment.id, experiment.prompt, experiment.createdAt, JSON.stringify(experiment.errors)]); }
+export async function saveTraceRun(experimentId: string, trace: TraceRun) { await (await db()).execute("INSERT INTO trace_runs (id, experiment_id, mode, turn_number, created_at, payload) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT(id) DO UPDATE SET payload = excluded.payload", [trace.id, experimentId, trace.mode, trace.turnNumber, Date.now(), JSON.stringify(trace)]); }
+export async function loadHistory(): Promise<{ experiments: StoredExperiment[]; traces: TraceRun[] }> { const database = await db(); const experiments = await database.select<Array<{ id: string; prompt: string; created_at: number; errors: string }>>("SELECT id, prompt, created_at, errors FROM experiments ORDER BY created_at DESC"); const rows = await database.select<Array<{ experiment_id: string; payload: string }>>("SELECT experiment_id, payload FROM trace_runs ORDER BY created_at DESC"); const traces = rows.flatMap((row) => { try { return [JSON.parse(row.payload) as TraceRun]; } catch { return []; } }); const byExperiment = new Map<string, TraceRun[]>(); rows.forEach((row, index) => byExperiment.set(row.experiment_id, [...(byExperiment.get(row.experiment_id) ?? []), traces[index]].filter(Boolean))); return { traces, experiments: experiments.map((item) => ({ id: item.id, prompt: item.prompt, createdAt: item.created_at, runs: byExperiment.get(item.id) ?? [], errors: JSON.parse(item.errors || "{}") })) }; }
