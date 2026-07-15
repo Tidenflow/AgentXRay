@@ -71,7 +71,7 @@ User Prompt
 → final assistant answer
 ```
 
-**AgentXRay** turns this black box into an observable message pipeline. Whether you're debugging why your agent hallucinated a tool call, tracing how context accumulates across ReAct rounds, or just curious what a Plan-and-Execute planner actually generates — AgentXRay gives you the X-ray vision to answer:
+**AgentXRay** turns this black box into an observable message pipeline. Across four agent modes — Basic LLM, Tool Calling, ReAct, and Plan-and-Execute — it shows exactly how each one assembles messages, calls tools, and grows its context, so you can answer:
 
 > *"How does a model output become a runtime decision and real code execution?"*
 
@@ -432,7 +432,7 @@ All configuration lives in `.env` (copy from `.env.example`):
 | Variable | Default | Description |
 |---|---|---|
 | `DEEPSEEK_API_KEY` | *(required)* | Your DeepSeek API key |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API base URL — change for proxies or OpenAI-compatible providers |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | API base URL — change only for a proxy or a self-hosted DeepSeek-compatible endpoint |
 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | `deepseek-v4-flash` for speed, `deepseek-v4-pro` for quality |
 | `DEEPSEEK_TEMPERATURE` | `0.7` | Sampling temperature (0.0–2.0) |
 
@@ -537,13 +537,14 @@ All four agent modes are fully implemented with real DeepSeek API calls and anno
 
 ## Roadmap
 
-- [ ] **Multi-provider support** — OpenAI, Anthropic, and other compatible APIs
-- [ ] **Streaming visualization** — watch tokens arrive in real time in the trace inspector
-- [ ] **Screenshots & demo video**
-- [ ] **Dark mode**
-- [ ] **Export traces** — download a trace run as JSON for sharing and debugging
-- [ ] **Diff mode** — compare two trace runs side by side
-- [ ] **Custom tool definitions** — define and register tools from the UI
+AgentXRay is deliberately narrow: **one provider (DeepSeek), four agent modes, explained well.** The goal is a clear, faithful trace of each mode — not a broad multi-provider platform. Everything below is about making those four flows sharper, not adding surface area.
+
+- [ ] **Screenshots & a short walkthrough** for each of the four modes
+- [ ] **Unify the step language** — bring the ReAct and Plan-and-Execute timelines fully in line with Basic LLM and Tool Calling
+- [ ] **Clearer empty & error states** in the trace inspector (parse failures, unknown tools, round-limit fallback)
+- [ ] **Copy-to-clipboard** for any payload panel
+
+Intentionally **out of scope**, to keep the four core flows easy to follow: multi-provider adapters, streaming, dark mode, trace export/diff, and UI-defined tools. DeepSeek speaks the OpenAI-compatible protocol, so pointing `DEEPSEEK_BASE_URL` at another compatible endpoint already works for experimentation — but the project isn't trying to be a provider-agnostic tool.
 
 ---
 
